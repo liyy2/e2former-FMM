@@ -16,40 +16,11 @@ class VecInitApproach(Enum):
     def __str__(self):
         return self.value
 
-
-class DiffusionTrainingLoss(Enum):
-    L1: str = "L1"
-    L2: str = "L2"
-    MSE: str = "MSE"
-    SmoothL1: str = "SmoothL1"
-
-    def __str__(self):
-        return self.value
-
-
 class ForceLoss(Enum):
     L1: str = "L1"
     L2: str = "L2"
     MSE: str = "MSE"
     SmoothL1: str = "SmoothL1"
-
-    def __str__(self):
-        return self.value
-
-
-class StressLoss(Enum):
-    L1: str = "L1"
-    L2: str = "L2"
-    MSE: str = "MSE"
-    SmoothL1: str = "SmoothL1"
-
-    def __str__(self):
-        return self.value
-
-
-class DiffusionTimeStepEncoderType(Enum):
-    DISCRETE_LEARNABLE: str = "DISCRETE_LEARNABLE"
-    POSITIONAL: str = "POSITIONAL"
 
     def __str__(self):
         return self.value
