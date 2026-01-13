@@ -1,10 +1,10 @@
-# E2Former-LSR
+# UBio-MolFM/E2Former-LSR
 
 <p align="center">
   <img src="./resources/main.png" alt="Architectural necessity and benchmark scope for long-range MLFFs" width="800"/>
 </p>
 
-This package implements the [Scalable Machine Learning Force Fields for Macromolecular Systems Through Long-Range Aware Message Passing](https://arxiv.org/abs/2601.03774).
+This repo contains the code for the [Scalable Machine Learning Force Fields for Macromolecular Systems Through Long-Range Aware Message Passing](https://arxiv.org/abs/2601.03774).
 
 At its core, E2Former utilizes **Wigner 6j convolution** for efficient and accurate tensor product operations, enabling the model to capture complex geometric interactions while preserving physical symmetries. Besides, we developed E2former-LSR, a unified SO(3)-equivariant neural architecture that integrates Long–Short Range Message Passing (LSR-MP) with an E2Former backbone to capture both local and nonlocal interactions in molecular systems.
 
