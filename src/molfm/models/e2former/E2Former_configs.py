@@ -17,28 +17,12 @@ class VecInitApproach(Enum):
         return self.value
 
 
-class DiffusionTrainingLoss(Enum):
-    L1: str = "L1"
-    MSE: str = "MSE"
-    SmoothL1: str = "SmoothL1"
-
-    def __str__(self):
-        return self.value
-
 
 class ForceLoss(Enum):
     L1: str = "L1"
     MSE: str = "MSE"
     SmoothL1: str = "SmoothL1"
     NoiseTolerentL1: str = "NoiseTolerentL1"
-
-    def __str__(self):
-        return self.value
-
-
-class DiffusionTimeStepEncoderType(Enum):
-    DISCRETE_LEARNABLE: str = "DISCRETE_LEARNABLE"
-    POSITIONAL: str = "POSITIONAL"
 
     def __str__(self):
         return self.value
@@ -51,14 +35,6 @@ class ForceHeadType(Enum):
 
     def __str__(self) -> str:
         return self.value
-
-
-# class GaussianFeatureNodeType(Enum):
-#     EXCHANGABLE: str = "EXCHANGABLE"
-#     NON_EXCHANGABLE: str = "NON_EXCHANGABLE"
-
-#     def __str__(self) -> str:
-#         return self.value
 
 
 # follow Escaip, but some parameter is unsed in e2former
