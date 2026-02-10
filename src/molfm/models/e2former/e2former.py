@@ -19,7 +19,29 @@ from fairchem.core.models.escn.so3 import SO3_Embedding, SO3_Rotation
 from fairchem.core.models.escn.so3 import SO3_Embedding, SO3_Rotation
     
 # for bessel radial basis
-from fairchem.core.models.gemnet.layers.radial_basis import RadialBasis
+try:
+    from fairchem.core.models.gemnet.layers.radial_basis import RadialBasis
+except ModuleNotFoundError:
+    class RadialBasis(torch.nn.Module):
+        """Fallback radial basis when GemNet optional deps are unavailable."""
+
+        def __init__(self, num_radial: int, cutoff: float, rbf=None):
+            super().__init__()
+            del rbf
+            self.cutoff = float(cutoff)
+            self.num_radial = int(num_radial)
+            self.register_buffer(
+                "centers",
+                torch.linspace(0.0, self.cutoff, self.num_radial, dtype=torch.float32),
+            )
+            # Match the spread of a standard Gaussian basis fallback.
+            self.gamma = 1.0 / max(self.cutoff / max(self.num_radial - 1, 1), 1e-6) ** 2
+
+        def forward(self, dist: torch.Tensor) -> torch.Tensor:
+            centers = self.centers.to(device=dist.device, dtype=dist.dtype)
+            diff = dist.unsqueeze(-1) - centers
+            out = torch.exp(-self.gamma * diff * diff)
+            return out * (dist.unsqueeze(-1) <= self.cutoff).to(dtype=out.dtype)
 from torch import logical_not, nn
 
 _AVG_DEGREE = 23.395238876342773
@@ -61,6 +83,7 @@ from .wigner6j.tensor_product import (
     E2TensorProductArbitraryOrder,
     Simple_TensorProduct_oTchannel,
 )
+from .fmm_e2former import E2AttentionNodeFMM
 
 _AVG_DEGREE = 23.395238876342773  # IS2RE: 100k, max_radius = 5, max_neighbors = 100
 
@@ -756,6 +779,179 @@ class E2AttentionArbOrder_sparse(torch.nn.Module):
         return node_output, attn_weight
 
 
+class E2AttentionHybridShortLong(torch.nn.Module):
+    """Hybrid attention: local edge-based E2Former + global node-based FMM."""
+
+    _LOCAL_ATTN_TYPES = {"zero-order", "first-order", "second-order", "all-order"}
+
+    def __init__(
+        self,
+        irreps_node_input="256x0e+64x1e+32x2e",
+        attn_weight_input_dim: int = 32,
+        num_attn_heads: int = 8,
+        attn_scalar_head: int = 32,
+        irreps_head="32x0e+8x1e+4x2e",
+        alpha_drop=0.1,
+        rescale_degree=False,
+        nonlinear_message=False,
+        proj_drop=0.1,
+        tp_type="QK_alpha@fmm-node+tp_cueq",
+        attn_type="hybrid",
+        add_rope=True,
+        layer_id=0,
+        irreps_origin="1x0e+1x1e+1x2e",
+        neighbor_weight=None,
+        atom_type_cnt=256,
+        norm_layer="identity",
+        fmm_num_kappa: int = 8,
+        fmm_kappa_min: float = 1.0,
+        fmm_kappa_max: float = 1.4,
+        hybrid_long_scale_init: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__()
+        local_attn_type = self._parse_local_attn_type(attn_type)
+        local_tp_type, fmm_tp_type = self._split_tp_type(tp_type)
+
+        self.local_attn_type = local_attn_type
+        self.local_tp_type = local_tp_type
+        self.fmm_tp_type = fmm_tp_type
+
+        self.local_attn = E2AttentionArbOrder_sparse(
+            irreps_node_input=irreps_node_input,
+            attn_weight_input_dim=attn_weight_input_dim,
+            num_attn_heads=num_attn_heads,
+            attn_scalar_head=attn_scalar_head,
+            irreps_head=irreps_head,
+            alpha_drop=alpha_drop,
+            rescale_degree=rescale_degree,
+            nonlinear_message=nonlinear_message,
+            proj_drop=proj_drop,
+            tp_type=local_tp_type,
+            attn_type=local_attn_type,
+            add_rope=add_rope,
+            layer_id=layer_id,
+            irreps_origin=irreps_origin,
+            neighbor_weight=neighbor_weight,
+            atom_type_cnt=atom_type_cnt,
+            norm_layer=norm_layer,
+            **kwargs,
+        )
+        self.global_attn = E2AttentionNodeFMM(
+            irreps_node_input=irreps_node_input,
+            attn_weight_input_dim=attn_weight_input_dim,
+            num_attn_heads=num_attn_heads,
+            attn_scalar_head=attn_scalar_head,
+            irreps_head=irreps_head,
+            alpha_drop=alpha_drop,
+            rescale_degree=rescale_degree,
+            nonlinear_message=nonlinear_message,
+            proj_drop=proj_drop,
+            tp_type=fmm_tp_type,
+            attn_type="fmm-node",
+            add_rope=add_rope,
+            layer_id=layer_id,
+            irreps_origin=irreps_origin,
+            neighbor_weight=neighbor_weight,
+            atom_type_cnt=atom_type_cnt,
+            norm_layer=norm_layer,
+            fmm_num_kappa=fmm_num_kappa,
+            fmm_kappa_min=fmm_kappa_min,
+            fmm_kappa_max=fmm_kappa_max,
+            **kwargs,
+        )
+        self.long_scale = nn.Parameter(
+            torch.tensor(float(hybrid_long_scale_init), dtype=torch.float32)
+        )
+
+    @classmethod
+    def _parse_local_attn_type(cls, attn_type: str) -> str:
+        if not isinstance(attn_type, str):
+            return "first-order"
+        token = attn_type.strip().lower()
+        if token in {"hybrid", "hybrid-fmm", "hybrid_node_fmm", "hybrid-node-fmm"}:
+            return "first-order"
+        local = None
+        if token.startswith("hybrid-"):
+            local = token.split("hybrid-", maxsplit=1)[1]
+        elif token.startswith("hybrid:"):
+            local = token.split("hybrid:", maxsplit=1)[1]
+        elif token.startswith("hybrid_"):
+            local = token.split("hybrid_", maxsplit=1)[1]
+        if local is None or local == "":
+            return "first-order"
+        if local not in cls._LOCAL_ATTN_TYPES:
+            raise ValueError(
+                "Hybrid attn_type must be 'hybrid' or 'hybrid-<local_type>' where "
+                f"local_type in {sorted(cls._LOCAL_ATTN_TYPES)}. Got {attn_type!r}."
+            )
+        return local
+
+    @staticmethod
+    def _split_tp_type(tp_type: str) -> tuple[str, str]:
+        if not isinstance(tp_type, str):
+            return "QK_alpha", "fmm-node"
+        token = tp_type.strip()
+        if "@" in token:
+            local_tp, fmm_tp = token.split("@", maxsplit=1)
+            if local_tp.strip() == "" or fmm_tp.strip() == "":
+                raise ValueError(
+                    "Hybrid tp_type with '@' must be '<local_tp>@<fmm_tp>', "
+                    f"got {tp_type!r}."
+                )
+            return local_tp.strip(), fmm_tp.strip()
+        if "fmm-node" in token.lower():
+            raise ValueError(
+                "Hybrid tp_type must include both branch settings when specifying "
+                "an FMM tp string. Use '<local_tp>@<fmm_tp>', e.g. "
+                "'QK_alpha@fmm-node+tp_cueq'."
+            )
+        return token, "fmm-node"
+
+    def forward(
+        self,
+        node_pos,
+        node_irreps_input,
+        edge_dis,
+        edge_vec,
+        attn_weight,
+        atomic_numbers,
+        poly_dist=None,
+        attn_mask=None,
+        batch=None,
+        batched_data=None,
+        **kwargs,
+    ):
+        local_out, updated_attn_weight = self.local_attn(
+            node_pos=node_pos,
+            node_irreps_input=node_irreps_input,
+            edge_dis=edge_dis,
+            edge_vec=edge_vec,
+            attn_weight=attn_weight,
+            atomic_numbers=atomic_numbers,
+            poly_dist=poly_dist,
+            attn_mask=attn_mask,
+            batch=batch,
+            batched_data=batched_data,
+            **kwargs,
+        )
+        global_out, _ = self.global_attn(
+            node_pos=node_pos,
+            node_irreps_input=node_irreps_input,
+            edge_dis=edge_dis,
+            edge_vec=edge_vec,
+            attn_weight=attn_weight,
+            atomic_numbers=atomic_numbers,
+            poly_dist=poly_dist,
+            attn_mask=attn_mask,
+            batch=batch,
+            batched_data=batched_data,
+            **kwargs,
+        )
+        fused = local_out + self.long_scale.to(dtype=local_out.dtype) * global_out
+        return fused, updated_attn_weight
+
+
 # class FeedForwardNetwork(torch.nn.Module):
 #     """
 #     Use two (FCTP + Gate)
@@ -855,6 +1051,10 @@ class TransBlock(torch.nn.Module):
         add_rope=True,
         sparse_attn=False,
         max_radius=15,
+        fmm_num_kappa: int = 8,
+        fmm_kappa_min: float = 1.0,
+        fmm_kappa_max: float = 1.4,
+        hybrid_long_scale_init: float = 1.0,
     ):
         super().__init__()
         self.irreps_node_input = (
@@ -890,8 +1090,14 @@ class TransBlock(torch.nn.Module):
 
         self.attn_type = attn_type
 
-        if isinstance(attn_type, str) and attn_type.endswith("order"):
+        if isinstance(attn_type, str) and attn_type.startswith("hybrid"):
+            func = E2AttentionHybridShortLong
+
+        elif isinstance(attn_type, str) and attn_type.endswith("order"):
             func = E2AttentionArbOrder_sparse
+
+        elif isinstance(attn_type, str) and attn_type.startswith(("fmm-node", "fmm_node")):
+            func = E2AttentionNodeFMM
 
         elif isinstance(attn_type, str) and attn_type.startswith("escn"):
             func = MessageBlock_escn
@@ -919,6 +1125,10 @@ class TransBlock(torch.nn.Module):
             sparse_attn=sparse_attn,
             max_radius=max_radius,
             norm_layer=norm_layer,
+            fmm_num_kappa=fmm_num_kappa,
+            fmm_kappa_min=fmm_kappa_min,
+            fmm_kappa_max=fmm_kappa_max,
+            hybrid_long_scale_init=hybrid_long_scale_init,
         )
 
         self.drop_path = None  # nn.Identity()
@@ -1097,6 +1307,7 @@ class TransBlock(torch.nn.Module):
             attn_weight=attn_weight,
             atomic_numbers=atomic_numbers,
             attn_mask=attn_mask,
+            batch=batch,
             batched_data=batched_data,
             add_rope=self.add_rope,
             sparse_attn=self.sparse_attn,
@@ -2786,6 +2997,9 @@ class E2former(torch.nn.Module):
         super().__init__()
         self.tp_type = tp_type
         self.attn_type = attn_type
+        self.node_only_attention = isinstance(attn_type, str) and attn_type.startswith(
+            ("fmm-node", "fmm_node")
+        )
         self.pbc_max_radius = pbc_max_radius  #
         self.max_neighbors = max_neighbors
         self.max_radius = max_radius
@@ -2813,6 +3027,14 @@ class E2former(torch.nn.Module):
         self.rescale_degree = rescale_degree
         self.nonlinear_message = nonlinear_message
         self.decouple_EF = decouple_EF
+        self.fmm_num_kappa = int(kwargs.pop("fmm_num_kappa", 8))
+        self.fmm_kappa_min = float(kwargs.pop("fmm_kappa_min", 1.0))
+        self.fmm_kappa_max = float(kwargs.pop("fmm_kappa_max", 1.4))
+        self.hybrid_long_scale_init = float(kwargs.pop("hybrid_long_scale_init", 1.0))
+        if self.node_only_attention and self.decouple_EF:
+            raise ValueError(
+                "decouple_EF is not supported with node-only FMM attention."
+            )
         if "0e" not in self.irreps_node_embedding:
             raise ValueError("sorry, the irreps node embedding must have 0e embedding")
 
@@ -2832,56 +3054,55 @@ class E2former(torch.nn.Module):
         ## this is for f( r_ij )
         self.basis_type = basis_type
         self.attn_biastype = attn_biastype
-        self.heads2basis = nn.Linear(
-            self.num_attn_heads, self.number_of_basis, bias=True
-        )
-        if self.basis_type == "gaussian":
-            self.rbf = GaussianRadialBasisLayer(
-                self.number_of_basis, cutoff=self.max_radius
+        self.heads2basis = None
+        self.rbf = None
+        self.edge_deg_embed_dense = None
+        if not self.node_only_attention:
+            self.heads2basis = nn.Linear(
+                self.num_attn_heads, self.number_of_basis, bias=True
             )
-        # elif self.basis_type == "gaussian_edge":
-        #     self.rbf = GaussianLayer_Edgetype(
-        #         self.number_of_basis, cutoff=self.max_radius
-        #     )
-        elif self.basis_type == "gaussiansmear":
-            self.rbf = GaussianSmearing(
-                self.number_of_basis, cutoff=self.max_radius, basis_width_scalar=2
-            )
-        elif self.basis_type == "bessel":
-            self.rbf = RadialBasis(
-                self.number_of_basis,
-                cutoff=self.max_radius,
-                rbf={"name": "spherical_bessel"},
-            )
-        else:
-            raise ValueError
+            if self.basis_type == "gaussian":
+                self.rbf = GaussianRadialBasisLayer(
+                    self.number_of_basis, cutoff=self.max_radius
+                )
+            elif self.basis_type == "gaussiansmear":
+                self.rbf = GaussianSmearing(
+                    self.number_of_basis, cutoff=self.max_radius, basis_width_scalar=2
+                )
+            elif self.basis_type == "bessel":
+                self.rbf = RadialBasis(
+                    self.number_of_basis,
+                    cutoff=self.max_radius,
+                    rbf={"name": "spherical_bessel"},
+                )
+            else:
+                raise ValueError
 
-        # edge
-        if (
-            "default" in edge_embedtype
-            or "highorder" in edge_embedtype
-            or "elec" in edge_embedtype
-        ):
-            self.edge_deg_embed_dense = EdgeDegreeEmbeddingNetwork_higherorder(
-                self.irreps_node_embedding,
-                avg_degree,
-                cutoff=self.max_radius,
-                number_of_basis=self.number_of_basis,
-                time_embed=self.time_embed,
-                use_atom_edge=True,
-                use_layer_norm="wolayernorm" not in edge_embedtype,
-            )
-        elif "eqv2" in edge_embedtype:
-            self.edge_deg_embed_dense = EdgeDegreeEmbeddingNetwork_eqv2(
-                self.irreps_node_embedding,
-                avg_degree,
-                cutoff=self.max_radius,
-                number_of_basis=self.number_of_basis,
-                lmax=len(self.irreps_node_embedding) - 1,
-                time_embed=self.time_embed,
-            )
-        else:
-            raise ValueError("please check edge embedtype")
+            if (
+                "default" in edge_embedtype
+                or "highorder" in edge_embedtype
+                or "elec" in edge_embedtype
+            ):
+                self.edge_deg_embed_dense = EdgeDegreeEmbeddingNetwork_higherorder(
+                    self.irreps_node_embedding,
+                    avg_degree,
+                    cutoff=self.max_radius,
+                    number_of_basis=self.number_of_basis,
+                    time_embed=self.time_embed,
+                    use_atom_edge=True,
+                    use_layer_norm="wolayernorm" not in edge_embedtype,
+                )
+            elif "eqv2" in edge_embedtype:
+                self.edge_deg_embed_dense = EdgeDegreeEmbeddingNetwork_eqv2(
+                    self.irreps_node_embedding,
+                    avg_degree,
+                    cutoff=self.max_radius,
+                    number_of_basis=self.number_of_basis,
+                    lmax=len(self.irreps_node_embedding) - 1,
+                    time_embed=self.time_embed,
+                )
+            else:
+                raise ValueError("please check edge embedtype")
 
         self.blocks = torch.nn.ModuleList()
         for i in range(self.num_layers):
@@ -2905,6 +3126,10 @@ class E2former(torch.nn.Module):
                 add_rope=self.add_rope,
                 sparse_attn=self.sparse_attn,
                 max_radius=max_radius,
+                fmm_num_kappa=self.fmm_num_kappa,
+                fmm_kappa_min=self.fmm_kappa_min,
+                fmm_kappa_max=self.fmm_kappa_max,
+                hybrid_long_scale_init=self.hybrid_long_scale_init,
             )
             self.blocks.append(blk)
 
@@ -2930,6 +3155,10 @@ class E2former(torch.nn.Module):
                 add_rope=self.add_rope,
                 sparse_attn=self.sparse_attn,
                 max_radius=max_radius,
+                fmm_num_kappa=self.fmm_num_kappa,
+                fmm_kappa_min=self.fmm_kappa_min,
+                fmm_kappa_max=self.fmm_kappa_max,
+                hybrid_long_scale_init=self.hybrid_long_scale_init,
             )
 
         self.scalar_dim = self.irreps_node_embedding[0][0]
@@ -3125,32 +3354,7 @@ class E2former(torch.nn.Module):
             ]  # e.g. n1*hidden [flatten_outcell_index]  -> n2*hidden
 
         batched_data["mol_type"] = mol_type
-
-        neighbor_info = construct_radius_neighbor(node_pos,node_mask,
-                              expand_node_pos,expand_node_mask,
-                              radius = self.max_radius,
-                              outcell_index = outcell_index,
-                              max_neighbors = self.max_neighbors)
-        batched_data.update(neighbor_info)
-        
-        f_edge_vec= neighbor_info["f_edge_vec"]
-        f_dist= neighbor_info["f_dist"]
-        f_poly_dist= neighbor_info["f_poly_dist"]
-        f_attn_mask = neighbor_info["f_attn_mask"]
-        f_dist_embedding = self.rbf(f_dist)  # flattn_N* topK* self.number_of_basis)
-
-        # print(torch.max(f_sparse_idx_node),torch.max(f_sparse_idx_expnode),torch.max(ptr),torch.max(expand_ptr))
-        # # this line could use to check the index's correctness
-        # batch_indices = torch.arange(B).unsqueeze(1).unsqueeze(2).expand(B, L, topK)
-        # test_edge_vec = (node_pos[:,:L].unsqueeze(dim = 2)-expand_node_pos[batch_indices,neighbor_indices])[node_mask]
-        # print('test edge vec ',torch.sum(torch.abs(edge_vec-test_edge_vec)[~attn_mask.squeeze()]))
-
-        # # this line could use to check the index's correctness
-        # batch_indices = torch.arange(B).unsqueeze(1).unsqueeze(2).expand(B, L, topK)
-        # test_src_ne = atomic_numbers[(torch.arange(B).reshape(B, 1).repeat(1,L2)),
-        #                              outcell_index][batch_indices,neighbor_indices][node_mask]
-        # src_ne = atomic_numbers[node_mask][flatten_sparse_indices_innode]
-        # print('test atomic numbers',torch.sum(torch.abs(test_src_ne-src_ne)[~attn_mask.squeeze()]))
+        batched_data["f_batch"] = f_batch
 
         # node_mask is used for node_embedding -> f_N*hidden
         # f_node_irreps = token_embedding[node_mask]
@@ -3161,90 +3365,100 @@ class E2former(torch.nn.Module):
         else:
             f_atom_embedding = self.default_node_embedding(atomic_numbers)
 
+        if self.node_only_attention:
+            # Pure node-only path: avoid edge-neighbor construction entirely.
+            f_edge_vec = f_node_pos.new_zeros((f_N1, 1, 3))
+            f_dist = f_node_pos.new_zeros((f_N1, 1))
+            f_poly_dist = f_node_pos.new_ones((f_N1, 1))
+            f_attn_mask = torch.zeros((f_N1, 1, 1), dtype=torch.bool, device=device)
+            f_dist_embedding = f_atom_embedding.new_zeros(
+                (f_N1, 1, self.number_of_basis)
+            )
+            f_node_irreps = torch.zeros(
+                (f_N1, (self.lmax + 1) ** 2, self._node_scalar_dim),
+                dtype=f_atom_embedding.dtype,
+                device=device,
+            )
+            f_node_irreps[:, 0, :] = f_atom_embedding
+        else:
+            neighbor_info = construct_radius_neighbor(node_pos,node_mask,
+                                  expand_node_pos,expand_node_mask,
+                                  radius = self.max_radius,
+                                  outcell_index = outcell_index,
+                                  max_neighbors = self.max_neighbors)
+            batched_data.update(neighbor_info)
+            
+            f_edge_vec= neighbor_info["f_edge_vec"]
+            f_dist= neighbor_info["f_dist"]
+            f_poly_dist= neighbor_info["f_poly_dist"]
+            f_attn_mask = neighbor_info["f_attn_mask"]
+            f_dist_embedding = self.rbf(f_dist)  # flattn_N* topK* self.number_of_basis)
 
-        coeffs = E2TensorProductArbitraryOrder.get_coeffs()
-        Y_powers = [
-            coeffs[0] * torch.ones_like(f_node_pos.narrow(-1, 0, 1).unsqueeze(dim=-1))
-        ]
-        # Y is pos. Precompute spherical harmonics for all orders
-        for i in range(1, self.lmax + 1):
-            Y_powers.append(
-                coeffs[i]
-                * e3nn.o3.spherical_harmonics(
-                    i, f_node_pos, normalize=False, normalization="integral"
-                ).unsqueeze(-1)
+            coeffs = E2TensorProductArbitraryOrder.get_coeffs()
+            Y_powers = [
+                coeffs[0] * torch.ones_like(f_node_pos.narrow(-1, 0, 1).unsqueeze(dim=-1))
+            ]
+            # Y is pos. Precompute spherical harmonics for all orders
+            for i in range(1, self.lmax + 1):
+                Y_powers.append(
+                    coeffs[i]
+                    * e3nn.o3.spherical_harmonics(
+                        i, f_node_pos, normalize=False, normalization="integral"
+                    ).unsqueeze(-1)
+                )
+
+            exp_Y_powers = [
+                coeffs[0]
+                * torch.ones_like(f_exp_node_pos.narrow(-1, 0, 1).unsqueeze(dim=-1))
+            ]
+            # Y is pos. Precompute spherical harmonics for all orders
+            for i in range(1, self.lmax + 1):
+                exp_Y_powers.append(
+                    coeffs[i]
+                    * e3nn.o3.spherical_harmonics(
+                        i, f_exp_node_pos, normalize=False, normalization="integral"
+                    ).unsqueeze(-1)
+                )
+
+            edge_vec_powers = [
+                coeffs[0] * torch.ones_like(f_edge_vec.narrow(-1, 0, 1).unsqueeze(dim=-1))
+            ]
+            # Y is pos. Precompute spherical harmonics for all orders
+            for i in range(1, self.lmax + 1):
+                edge_vec_powers.append(
+                    e3nn.o3.spherical_harmonics(
+                        i, f_edge_vec, normalize=True, normalization="integral"
+                    ).unsqueeze(-1)
+                )
+            edge_vec_powers = torch.cat(edge_vec_powers, dim=-2)
+
+            batched_data.update(
+                {
+                    "f_exp_node_pos": f_exp_node_pos,
+                    "f_outcell_index": f_outcell_index,
+                    # "edge_inter_mask": edge_inter_mask,  # used for escaip attention
+                    "Y_powers": Y_powers,
+                    "exp_Y_powers": exp_Y_powers,
+                    "edge_vec_powers": edge_vec_powers,
+                }
+            )
+            # not use sparse mode
+            edge_degree_embedding_dense = self.edge_deg_embed_dense(
+                f_atom_embedding,
+                f_node_pos,
+                f_dist,
+                edge_scalars=f_dist_embedding,
+                edge_vec=f_edge_vec,
+                batch=None,
+                attn_mask=f_attn_mask,
+                atomic_numbers=atomic_numbers,
+                batched_data=batched_data,
+                time_embed=time_embed,
             )
 
-        exp_Y_powers = [
-            coeffs[0]
-            * torch.ones_like(f_exp_node_pos.narrow(-1, 0, 1).unsqueeze(dim=-1))
-        ]
-        # Y is pos. Precompute spherical harmonics for all orders
-        for i in range(1, self.lmax + 1):
-            exp_Y_powers.append(
-                coeffs[i]
-                * e3nn.o3.spherical_harmonics(
-                    i, f_exp_node_pos, normalize=False, normalization="integral"
-                ).unsqueeze(-1)
-            )
-
-        edge_vec_powers = [
-            coeffs[0] * torch.ones_like(f_edge_vec.narrow(-1, 0, 1).unsqueeze(dim=-1))
-        ]
-        # Y is pos. Precompute spherical harmonics for all orders
-        for i in range(1, self.lmax + 1):
-            edge_vec_powers.append(
-                e3nn.o3.spherical_harmonics(
-                    i, f_edge_vec, normalize=True, normalization="integral"
-                ).unsqueeze(-1)
-            )
-        edge_vec_powers = torch.cat(edge_vec_powers, dim=-2)
-
-        batched_data.update(
-            {
-                "f_exp_node_pos": f_exp_node_pos,
-                "f_outcell_index": f_outcell_index,
-                # "edge_inter_mask": edge_inter_mask,  # used for escaip attention
-                "Y_powers": Y_powers,
-                "exp_Y_powers": exp_Y_powers,
-                "edge_vec_powers": edge_vec_powers,
-            }
-        )
-        # f_N1 = f_node_pos.shape[0]
-        # edge_mask = ~attn_mask.reshape(-1)
-        # data = {"pos":f_node_pos,
-        #         "atomic_numbers":atomic_numbers,
-        #         "batch":f_batch,
-        #         "natoms":torch.sum(node_mask,dim = -1),
-        #         "node_offset":0,
-        #         "atomic_numbers_full":atomic_numbers,
-        #         "batch_full":f_batch,
-        #         "edge_index":torch.stack([f_sparse_idx_node.reshape(-1).to(device)[edge_mask],
-        #                       torch.arange(f_N1).reshape(f_N1,-1).repeat(1,topK).reshape(-1).to(device)[edge_mask]
-        #                         ],dim = 0),
-        #         "edge_distance":f_dist.reshape(f_N1*topK)[edge_mask],
-        #         "edge_distance_vec":f_edge_vec.reshape(f_N1*topK,3)[edge_mask],
-
-        #         }
-        # return self.decoder(Data(**data))
-        # if torch.any(torch.isnan(atom_embedding)):assert(False)
-        # not use sparse mode
-        edge_degree_embedding_dense = self.edge_deg_embed_dense(
-            f_atom_embedding,
-            f_node_pos,
-            f_dist,
-            edge_scalars=f_dist_embedding,
-            edge_vec=f_edge_vec,
-            batch=None,
-            attn_mask=f_attn_mask,
-            atomic_numbers=atomic_numbers,
-            batched_data=batched_data,
-            time_embed=time_embed,
-        )
-
-        f_node_irreps = edge_degree_embedding_dense
-        # node_irreps = torch.zeros(B,L,9,self.irreps_node_embedding[0][0],device = device)
-        f_node_irreps[:, 0, :] = f_node_irreps[:, 0, :] + f_atom_embedding
+            f_node_irreps = edge_degree_embedding_dense
+            # node_irreps = torch.zeros(B,L,9,self.irreps_node_embedding[0][0],device = device)
+            f_node_irreps[:, 0, :] = f_node_irreps[:, 0, :] + f_atom_embedding
         node_irreps_his = torch.zeros(
             (B, L, (self.lmax + 1) ** 2, self._node_scalar_dim), device=device
         )
@@ -3296,6 +3510,7 @@ class E2former(torch.nn.Module):
                 attn_weight=f_dist_embedding,
                 atomic_numbers=atomic_numbers,
                 attn_mask=f_attn_mask,
+                batch=f_batch,
                 batched_data=batched_data,
                 add_rope=self.add_rope,
                 sparse_attn=self.sparse_attn,

@@ -1,0 +1,309 @@
+% NeurIPS-style core writeup (Intro + Preliminaries + Methods + Theorems + Proofs)
+% Replace neurips_2024 with the correct style file for your year if needed.
+
+\documentclass{article}
+
+% \usepackage[final]{neurips_2024}
+
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage[numbers,sort&compress]{natbib}
+
+% -------------------- Macros --------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Sph}{\mathbb{S}}
+\newcommand{\ii}{\mathrm{i}}
+\newcommand{\dd}{\,\mathrm{d}}
+\newcommand{\norm}[1]{\left\lVert #1\right\rVert}
+\newcommand{\ip}[2]{\left\langle #1,#2\right\rangle}
+\newcommand{\rhat}{\widehat{\mathbf r}}
+\newcommand{\uhat}{\widehat{\mathbf u}}
+
+\DeclareMathOperator{\STF}{STF}
+
+% -------------------- Theorem envs --------------------
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{lemma}[theorem]{Lemma}
+
+\theoremstyle{definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\newtheorem{definition}[theorem]{Definition}
+
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+% -------------------- Title --------------------
+\title{Broad E2Former: True Node-Wise $\mathrm{E}(3)$-Equivariant Attention via Spectral Translation Operators}
+
+\author{Anonymous Authors}
+
+\begin{document}
+
+\maketitle
+
+\section{Preliminaries}
+
+\paragraph{Notation (aligned with E2Former).}
+Let $\mathcal{V}=\{1,\dots,N\}$ be the node set with positions $\mathbf r_i\in\mathbb R^3$ and neighborhoods $\mathcal N(i)\subseteq \mathcal V$.
+For $i,j\in\mathcal V$, define $\mathbf r_{ij}:=\mathbf r_i-\mathbf r_j$, $r_{ij}:=\|\mathbf r_{ij}\|$, and $\widehat{\mathbf r}_{ij}:=\mathbf r_{ij}/r_{ij}$ when $r_{ij}\neq 0$.
+We use $\ell$ for angular degree and $m\in\{-\ell,\dots,\ell\}$ for order.
+Write $\mathbf Y^{(\ell)}(\widehat{\mathbf r})\in\mathbb R^{2\ell+1}$ for real spherical harmonics (stacked over $m$) and
+\begin{equation}
+\mathbf R^{(\ell)}(\mathbf r)\;:=\;r^\ell\,\mathbf Y^{(\ell)}(\widehat{\mathbf r}),\qquad r=\|\mathbf r\|,
+\end{equation}
+for regular (solid) harmonics in the same basis.
+Node irreps are denoted $\mathbf h_i^{(\ell)}\in\mathbb R^{(2\ell+1)\times c_\ell}$ and $\mathbf h_i=\{\mathbf h_i^{(\ell)}\}_{\ell\le L_{\max}}$.
+
+We denote CG coupling and projection by $[\cdot\otimes\cdot]^{(\ell)}$.
+Wigner-$6j$ recoupling is written abstractly as $\otimes^{6j}$ to indicate a change of coupling order governed by Wigner-$6j$ symbols:
+\begin{equation}
+\big[\mathbf a\otimes [\mathbf b\otimes \mathbf c]^{(\ell_{bc})}\big]^{(\ell)}
+\;=\;
+\sum_{\ell_{ab}}
+\mathcal W(\ell_a,\ell_b,\ell_c;\ell,\ell_{ab},\ell_{bc})\,
+\big[[\mathbf a\otimes \mathbf b]^{(\ell_{ab})}\otimes \mathbf c\big]^{(\ell)}.
+\end{equation}
+
+\paragraph{Linearized attention coefficients.}
+We write $\alpha_{ij}$ for a scalar edge coefficient (attention weight).
+To obtain an edge-free evaluation, we adopt a standard linear-attention kernel factorization
+\begin{equation}\label{eq:alpha_linear}
+\alpha_{ij}\ \approx\ \frac{\langle \varphi(\mathbf q_i),\,\varphi(\mathbf k_j)\rangle}{Z_i},
+\qquad
+Z_i:=\sum_{n\in\mathcal N(i)}\langle \varphi(\mathbf q_i),\,\varphi(\mathbf k_n)\rangle,
+\end{equation}
+where $\mathbf q_i,\mathbf k_j\in\mathbb R^{d}$ are (scalarized) queries/keys, and $\varphi:\mathbb R^d\to\mathbb R^{d_\varphi}$ is a nonnegative feature map so that $Z_i>0$.
+
+\paragraph{Fast multipole methods (FMM) viewpoint.}
+Fast multipole methods accelerate sums $\sum_j w_j K(\mathbf x_i,\mathbf y_j)$ by expressing $K$ (exactly or approximately) in a separable basis and using translation operators to rewrite dependence on displacements into source/target expansions.
+Algebraically, the essence is a \emph{degenerate kernel} representation
+\begin{equation}\label{eq:fmm_degenerate}
+K(\mathbf x,\mathbf y)\ \approx\ \sum_{p=1}^P \phi_p(\mathbf x)\,\psi_p(\mathbf y),
+\end{equation}
+which enables moment formation $A_p=\sum_j w_j\psi_p(\mathbf y_j)$ and evaluation $u(\mathbf x_i)=\sum_p \phi_p(\mathbf x_i)A_p$.
+In spherical bases, the translation operators are governed by angular momentum coupling (CG/Wigner symbols).
+We will show that E2Former corresponds to an \emph{exact finite} translation operator in the regular solid-harmonic basis, while our method uses a \emph{spectral} translation operator that supports general radial kernels with controlled truncation.
+
+
+\section{Background: E2Former and EFA}
+
+\subsection{E2Former: Wigner-$6j$ convolution as a finite translation operator}
+E2Former starts from an $\mathrm{SO}(3)$-equivariant node convolution that couples node irreps with edge geometry via regular harmonics:
+\begin{equation}\label{eq:e2former_so3conv}
+\mathbf u_i
+\;:=\;
+\sum_{j\in\mathcal N(i)}
+\Big[\mathbf h_j\otimes \mathbf R^{(\ell)}(\mathbf r_{ij})\Big]^{(\ell_\text{out})},
+\end{equation}
+where the projection $\ell_\text{out}$ depends on the value irreps and the kernel order.
+E2Former exploits the fact that $\mathbf R^{(\ell)}(\mathbf r)$ is a homogeneous polynomial tensor, and therefore admits an \emph{exact finite} translation identity (binomial local expansion) in the irrep algebra.
+Combined with Wigner-$6j$ recoupling, this yields a node-centric refactorization of the form
+\begin{equation}\label{eq:e2former_factorized}
+\sum_{j\in\mathcal N(i)} \mathbf h_j \otimes \mathbf R^{(\ell)}(\mathbf r_{ij})
+\;=\;
+\sum_{u=0}^{\ell}(-1)^{\ell-u}\binom{\ell}{u}\;
+\mathbf R^{(u)}(\mathbf r_i)\ \otimes^{6j}\
+\Big(\sum_{j\in\mathcal N(i)} \mathbf h_j \otimes \mathbf R^{(\ell-u)}(\mathbf r_j)\Big),
+\end{equation}
+which shifts the dominant tensor-product work from edges to nodes.
+
+\subsection{EFA: plane-wave positional encodings with linear attention}
+Euclidean Fast Attention (EFA) introduces Euclidean rotary positional encodings (ERoPE) based on phases $e^{i\omega\,\mathbf u\cdot \mathbf r}$.
+In dot-product attention, such phases induce dependence on displacements via
+\begin{equation}\label{eq:erope_displacement}
+\langle \mathbf q_i e^{i\omega \mathbf u\cdot \mathbf r_i},\ \mathbf k_j e^{i\omega \mathbf u\cdot \mathbf r_j}\rangle
+=
+\langle \mathbf q_i,\mathbf k_j\rangle\ e^{i\omega \mathbf u\cdot(\mathbf r_i-\mathbf r_j)}.
+\end{equation}
+Combined with linear attention, this yields global mixing at linear cost.
+Rotation handling is achieved by integrating (or quadrature-approximating) over $\mathbf u\in S^2$.
+
+\subsection{Limitations and the opportunity for a broad theory}
+E2Former provides an exact and elegant refactorization, but it is specialized to kernels generated by regular solid harmonics (polynomial structure) and does not directly yield a systematic separable expansion for general radial factors $f_\ell(r_{ij})$ multiplying $\mathbf Y^{(\ell)}(\widehat{\mathbf r}_{ij})$.
+EFA yields linear-time global mixing through plane-wave separability, but it is presented as an attention mechanism and does not by itself provide a representation-theoretic kernel calculus for arbitrary $\ell>0$ with controlled radial approximation.
+A unified view is to treat both as instances of translation operators: E2Former is a \emph{finite, exact} translation in a polynomial (solid-harmonic) basis, while EFA is a \emph{spectral} translation built from plane waves.
+This suggests a ``broad E2Former'' that keeps the spherical-tensor structure of MLFFs while inheriting the spectral separability of plane-wave methods.
+
+\subsection{Fresh perspective: E2Former as a special case of FMM}
+In FMM, one selects a basis in which the kernel admits efficient translations between centers.
+Regular solid harmonics $\mathbf R^{(\ell)}$ are a canonical basis for multipole/local expansions of polynomial/Laplace-type objects, and their translation is finite and governed by CG algebra.
+Equation~\eqref{eq:e2former_factorized} can be read as precisely such a translation: the edge-centered basis $\mathbf R^{(\ell)}(\mathbf r_{ij})$ is expanded into a finite sum of products of node-centered bases $\mathbf R^{(u)}(\mathbf r_i)$ and $\mathbf R^{(\ell-u)}(\mathbf r_j)$, followed by recoupling (a change of contraction order) to expose moment-like aggregation.
+E2Former is therefore a single-level, fixed-order instance of the FMM paradigm (without hierarchical clustering), specialized to the solid-harmonic kernel class.
+The goal below is to extend this paradigm to the broader kernel family $f_\ell(r)\mathbf Y^{(\ell)}(\widehat{\mathbf r})$ by switching to a spectral basis that supports general radial functions.
+
+
+\section{Methods: Spectral Broad E2Former and True Node-wise Factorization}
+
+\subsection{Equivariant attention with radial--angular kernels}
+Let $\mathbf v_j^{(\lambda)}\in\mathbb R^{(2\lambda+1)\times c_\lambda}$ be a value irrep of order $\lambda$.
+Fix a kernel order $\ell$ and define the geometric kernel
+\begin{equation}\label{eq:geom_kernel}
+\mathbf K^{(\ell)}(\mathbf r)\;:=\;f_\ell(\|\mathbf r\|)\,\mathbf Y^{(\ell)}(\widehat{\mathbf r}).
+\end{equation}
+We consider the attention-weighted $\mathrm{SO}(3)$-equivariant aggregation producing an output irrep of order $L$:
+\begin{equation}\label{eq:operator}
+\mathbf m_i^{(L)}
+\;:=\;
+\sum_{j\in\mathcal N(i)} \alpha_{ij}\;
+\Big[\mathbf v_j^{(\lambda)}\otimes \mathbf K^{(\ell)}(\mathbf r_{ij})\Big]^{(L)}.
+\end{equation}
+This covers common MLFF constructions when $f_\ell$ is parameterized by a learnable RBF/MLP with cutoff envelope.
+
+\subsection{A spectral basis compatible with translations}
+Define the spherical Bessel--harmonic wave of order $\ell$ and frequency $\kappa>0$:
+\begin{equation}
+\mathbf B^{(\ell)}_\kappa(\mathbf r)
+\;:=\;
+j_\ell(\kappa\|\mathbf r\|)\,\mathbf Y^{(\ell)}(\widehat{\mathbf r}).
+\end{equation}
+The plane-wave expansion implies that $\mathbf B^{(\ell)}_\kappa$ is the $\ell$-th spherical-harmonic projection of a plane wave.
+
+\begin{theorem}[Plane-wave projector]\label{thm:pw}
+There exists a basis-dependent constant $c_\ell$ such that
+\begin{equation}\label{eq:pw}
+\mathbf B^{(\ell)}_\kappa(\mathbf r)
+\;=\;
+c_\ell \int_{S^2} \mathbf Y^{(\ell)}(\mathbf u)\,e^{i\kappa\,\mathbf u\cdot \mathbf r}\,d\mathbf u.
+\end{equation}
+\end{theorem}
+
+\begin{corollary}[Exact displacement separation]\label{cor:sep}
+For $\mathbf r_{ij}=\mathbf r_i-\mathbf r_j$,
+\begin{equation}\label{eq:sep}
+\mathbf B^{(\ell)}_\kappa(\mathbf r_{ij})
+\;=\;
+c_\ell \int_{S^2} \mathbf Y^{(\ell)}(\mathbf u)\,
+e^{i\kappa\,\mathbf u\cdot \mathbf r_i}\,e^{-i\kappa\,\mathbf u\cdot \mathbf r_j}\,d\mathbf u.
+\end{equation}
+\end{corollary}
+
+\subsection{Radial modeling and controlled approximation}
+We approximate the MLFF radial $f_\ell$ on a bounded range $[0,r_{\max}]$ by a finite mixture of spherical Bessel functions:
+\begin{assumption}[Radial approximation]\label{ass:radial}
+There exist $\{\kappa_q\}_{q=1}^Q$ and coefficients $\{a_{\ell q}\}_{q=1}^Q$ such that
+\begin{equation}\label{eq:radial}
+\sup_{0\le r\le r_{\max}}
+\left|f_\ell(r)-\sum_{q=1}^Q a_{\ell q}\,j_\ell(\kappa_q r)\right|
+\ \le\ \varepsilon_{\mathrm{rad}}.
+\end{equation}
+\end{assumption}
+This assumption can be realized by (i) choosing $\kappa_q$ on a fixed grid (or Bessel zeros) and learning $a_{\ell q}$, or (ii) distilling a learned RBF/MLP $f_\ell$ into the spectral basis.
+
+Combining \eqref{eq:geom_kernel}, \eqref{eq:radial}, and Corollary~\ref{cor:sep} yields a separable integral form for $\mathbf K^{(\ell)}(\mathbf r_{ij})$:
+\begin{equation}\label{eq:kernel_integral}
+\mathbf K^{(\ell)}(\mathbf r_{ij})
+\ \approx\
+\sum_{q=1}^Q a_{\ell q}\,\mathbf B^{(\ell)}_{\kappa_q}(\mathbf r_{ij})
+\ =\
+\sum_{q=1}^Q a_{\ell q}\,c_\ell \int_{S^2} \mathbf Y^{(\ell)}(\mathbf u)\,
+e^{i\kappa_q \mathbf u\cdot \mathbf r_i}\,e^{-i\kappa_q \mathbf u\cdot \mathbf r_j}\,d\mathbf u.
+\end{equation}
+
+\subsection{Finite-rank discretization via spherical quadrature}
+Let $\{(\mathbf u_s,w_s)\}_{s=1}^S$ be a quadrature rule on $S^2$.
+Define phase features $\psi_{q,s}(\mathbf r):=e^{i\kappa_q\,\mathbf u_s\cdot \mathbf r}$.
+Then \eqref{eq:kernel_integral} becomes the finite-rank separable approximation
+\begin{equation}\label{eq:kernel_finite}
+\mathbf K^{(\ell)}(\mathbf r_{ij})
+\ \approx\
+\sum_{q=1}^Q\sum_{s=1}^S
+\gamma_{\ell q}\,w_s\,
+\mathbf Y^{(\ell)}(\mathbf u_s)\,
+\psi_{q,s}(\mathbf r_i)\,\psi_{q,s}(\mathbf r_j)^\ast,
+\qquad \gamma_{\ell q}:=a_{\ell q}c_\ell.
+\end{equation}
+In real-valued implementations, $\psi_{q,s}$ is replaced by paired channels $(\cos(\kappa_q\mathbf u_s\cdot \mathbf r),\sin(\kappa_q\mathbf u_s\cdot \mathbf r))$, and complex conjugation becomes a fixed sign flip.
+
+\subsection{Main theorem: true node-wise factorization (edge-free)}
+Insert \eqref{eq:alpha_linear} and \eqref{eq:kernel_finite} into \eqref{eq:operator} and collect all $j$-dependence into global moments.
+
+\begin{theorem}[True node-wise factorization of equivariant attention]\label{thm:nodewise}
+Assume \eqref{eq:alpha_linear} and \eqref{eq:kernel_finite}.
+Define the key-sum $\mathbf s:=\sum_{j\in\mathcal N(i)}\varphi(\mathbf k_j)\in\mathbb R^{d_\varphi}$ and, for each $(q,s)$, the moment tensor
+\begin{equation}\label{eq:moments}
+\mathbf M_{q,s}^{(\lambda)}
+\;:=\;
+\sum_{j\in\mathcal N(i)}
+\varphi(\mathbf k_j)\ \otimes\ \big(\psi_{q,s}(\mathbf r_j)^\ast\,\mathbf v_j^{(\lambda)}\big)
+\;\in\;
+\mathbb R^{d_\varphi\times(2\lambda+1)\times c_\lambda}.
+\end{equation}
+Then the operator \eqref{eq:operator} admits the edge-free evaluation
+\begin{equation}\label{eq:nodewise}
+\mathbf m_i^{(L)}
+\ \approx\
+\frac{1}{\langle \varphi(\mathbf q_i),\mathbf s\rangle}
+\sum_{q=1}^Q\sum_{s=1}^S
+\gamma_{\ell q}\,w_s\;\psi_{q,s}(\mathbf r_i)\;
+\Big[
+\big(\varphi(\mathbf q_i)^\top \mathbf M_{q,s}^{(\lambda)}\big)\otimes \mathbf Y^{(\ell)}(\mathbf u_s)
+\Big]^{(L)}.
+\end{equation}
+All dependence on $j$ is contained in $\mathbf s$ and $\{\mathbf M_{q,s}^{(\lambda)}\}$, which are computed by global sums without explicit edges.
+\end{theorem}
+
+\begin{proof}
+Substitute \eqref{eq:alpha_linear} and \eqref{eq:kernel_finite} into \eqref{eq:operator}:
+\[
+\mathbf m_i^{(L)}\approx
+\sum_{j}\frac{\langle \varphi(\mathbf q_i),\varphi(\mathbf k_j)\rangle}{Z_i}
+\sum_{q,s}\gamma_{\ell q}w_s
+\Big[\mathbf v_j^{(\lambda)}\otimes \mathbf Y^{(\ell)}(\mathbf u_s)\Big]^{(L)}
+\psi_{q,s}(\mathbf r_i)\psi_{q,s}(\mathbf r_j)^\ast.
+\]
+Interchange the sums over $j$ and $(q,s)$ and regroup all $j$-dependent factors into $\mathbf M_{q,s}^{(\lambda)}$.
+The normalization $Z_i=\langle \varphi(\mathbf q_i),\mathbf s\rangle$ yields \eqref{eq:nodewise}.
+\end{proof}
+
+\paragraph{Complexity and regimes.}
+For global mixing $\mathcal N(i)=\mathcal V$, forming all $\mathbf M_{q,s}^{(\lambda)}$ costs $O(NQS\,d_\varphi)$ (times value-channel factors), and evaluating \eqref{eq:nodewise} costs $O(NQS\,d_\varphi)$ plus $O(NQS)$ CG products; there is no $O(N^2)$ or $O(|\mathcal E|)$ term.
+For local neighborhoods, \eqref{eq:nodewise} can be used as a long-range/global block, optionally combined with a local E2Former block for short-range accuracy.
+
+\subsection{Specializations and the FMM unification}
+
+\paragraph{EFA as $\ell=0$.}
+When $\ell=0$, $\mathbf Y^{(0)}(\mathbf u_s)$ is constant and CG projection is trivial ($L=\lambda$).
+Then \eqref{eq:nodewise} reduces to linear attention on phase-encoded values, recovering the ERoPE-style structure.
+
+\paragraph{E2Former as a finite translation operator (polynomial limit).}
+E2Former’s kernel is generated by regular solid harmonics $\mathbf R^{(\ell)}(\mathbf r_{ij})$, which admit the exact finite translation identity
+\begin{equation}\label{eq:solid_translation}
+\mathbf R^{(\ell)}(\mathbf r_i-\mathbf r_j)
+=
+\sum_{u=0}^{\ell} C_{\ell,u}\,
+\Big[\mathbf R^{(u)}(\mathbf r_i)\otimes \mathbf R^{(\ell-u)}(\mathbf r_j)\Big]^{(\ell)},
+\end{equation}
+for coefficients $C_{\ell,u}$ determined by the chosen normalization.
+Together with Wigner-$6j$ recoupling, this yields \eqref{eq:e2former_factorized}.
+In the FMM view, \eqref{eq:solid_translation} is the exact, finite translation rule for regular solid-harmonic multipoles.
+Our spectral construction replaces the polynomial basis by $\mathbf B^{(\ell)}_\kappa$ to support general radial kernels $f_\ell$ with controlled truncation $(Q,S)$.
+
+\paragraph{Interpretation as an equivariant FMM layer.}
+Equation \eqref{eq:nodewise} has the canonical degenerate-kernel structure \eqref{eq:fmm_degenerate}:
+$\mathbf M_{q,s}^{(\lambda)}$ are global ``moments'' (source expansions), and each node $i$ performs local evaluation using $\psi_{q,s}(\mathbf r_i)$ and spherical weights $\mathbf Y^{(\ell)}(\mathbf u_s)$.
+Unlike classical FMM, we do not require a hierarchical tree to remove quadratic cost because linear attention already provides a global moment mechanism; however, the translation-operator algebra and basis choice are exactly those underlying multipole methods.
+This yields a principled broadening of E2Former from polynomial kernels to general MLFF radial kernels.
+
+\section{Remarks on implementation (concise)}
+The proposed layer is implemented by:
+(i) choosing $(\kappa_q)_{q\le Q}$ and spherical quadrature $(\mathbf u_s,w_s)_{s\le S}$;
+(ii) computing phase features $\psi_{q,s}(\mathbf r_i)$ for all nodes;
+(iii) forming moments \eqref{eq:moments} and key-sum $\mathbf s$ by a single pass over nodes;
+(iv) evaluating \eqref{eq:nodewise} with CG coupling as in E2Former.
+All quantities are real-valued in practice by doubling phase channels with $\cos/\sin$.
+
+% References (placeholders)
+% \cite{li2025e2former}  arXiv:2501.19216
+% \cite{frank2024efa}    arXiv:2412.08541
+% \cite{greengardrokhlin1987}  JCP 73(2):325--348
+
+
+\end{document}
+

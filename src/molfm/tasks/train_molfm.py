@@ -39,6 +39,17 @@ from torch.optim import Adam
 
 kcalmol_to_ev = 0.0433634
 
+_MD22_SAMPLE_SIZE_DEFAULTS = {
+    "at_at": 3000,
+    "at_at_cg_cg": 2000,
+    "stachyose": 8000,
+    "dha": 8000,
+    "ac_ala3_nhme": 6000,
+    "buckyball_catcher": 600,
+    "double_walled_nanotube": 800,
+    "chig": 8000,
+}
+
 class Identity(nn.Module):
     def __init__(
         self,
@@ -71,9 +82,90 @@ class SmallMolConfig(DistributedConfig, MOLFMConfig):
     loss_unit: str = "ev"
     loss_fn: str = "mae"
     data_path_list_valid: str = ""
+    md22_protocol: bool = False
+    md22_molecule: str = ""
+    md22_sample_size: int = -1
+    md22_train_prop: float = 0.95
+    md22_seed: int = 48
 
 cs = ConfigStore.instance()
 cs.store(name="config_molfm_schema", node=SmallMolConfig)
+
+
+def _resolve_md22_sample_size(
+    md22_molecule: str,
+    dataset_name: str,
+    data_path: str,
+    explicit_sample_size: int,
+) -> int:
+    if explicit_sample_size >= 0:
+        return explicit_sample_size
+
+    molecule_key = md22_molecule.lower().strip()
+    dataset_key = dataset_name.lower().strip()
+    path_key = data_path.lower()
+
+    if molecule_key in _MD22_SAMPLE_SIZE_DEFAULTS:
+        return _MD22_SAMPLE_SIZE_DEFAULTS[molecule_key]
+    if dataset_key in _MD22_SAMPLE_SIZE_DEFAULTS:
+        return _MD22_SAMPLE_SIZE_DEFAULTS[dataset_key]
+
+    for key, value in _MD22_SAMPLE_SIZE_DEFAULTS.items():
+        if key in path_key:
+            return value
+
+    return -1
+
+
+def _split_md22_protocol(dataset, dataset_name: str, data_path: str, args):
+    sample_size = _resolve_md22_sample_size(
+        md22_molecule=args.md22_molecule,
+        dataset_name=dataset_name,
+        data_path=data_path,
+        explicit_sample_size=args.md22_sample_size,
+    )
+    if sample_size < 0:
+        raise ValueError(
+            "MD22 protocol enabled but sample size is unknown. "
+            "Set md22_sample_size explicitly or provide md22_molecule / dataset name "
+            f"matching {_MD22_SAMPLE_SIZE_DEFAULTS.keys()}."
+        )
+
+    total_size = len(dataset)
+    if sample_size > total_size:
+        raise ValueError(
+            f"MD22 sample_size ({sample_size}) is larger than dataset size ({total_size}) "
+            f"for dataset '{dataset_name}'."
+        )
+    if not (0.0 < args.md22_train_prop < 1.0):
+        raise ValueError(f"md22_train_prop must be in (0, 1), got {args.md22_train_prop}.")
+
+    train_size = int(sample_size * args.md22_train_prop)
+    valid_size = sample_size - train_size
+    test_size = total_size - sample_size
+    if train_size <= 0 or valid_size <= 0:
+        raise ValueError(
+            f"Invalid MD22 split sizes for sample_size={sample_size}, train_prop={args.md22_train_prop}: "
+            f"train={train_size}, valid={valid_size}."
+        )
+
+    split_generator = torch.Generator().manual_seed(args.md22_seed)
+    train_dataset, valid_dataset, test_dataset = torch.utils.data.random_split(
+        dataset,
+        [train_size, valid_size, test_size],
+        generator=split_generator,
+    )
+    logger.info(
+        "MD22 protocol split | dataset=%s | total=%d | sample_size=%d | train=%d | valid=%d | test=%d | seed=%d",
+        dataset_name,
+        total_size,
+        sample_size,
+        train_size,
+        valid_size,
+        test_size,
+        args.md22_seed,
+    )
+    return train_dataset, valid_dataset, test_dataset
 
 
 def load_data(args, extra_collate_fn=None):
@@ -120,6 +212,11 @@ def load_data(args, extra_collate_fn=None):
             remove_atomref_energy=remove_atomref_energy,
         )
         if data_path_valid:
+            if args.md22_protocol:
+                logger.warning(
+                    "md22_protocol=True but explicit validation path is provided; "
+                    "using explicit train/valid files and skipping MD22 protocol split."
+                )
             train_dataset = dataset
             valid_dataset = MoleculeLMDBDataset(
                 args,
@@ -128,14 +225,22 @@ def load_data(args, extra_collate_fn=None):
                 remove_atomref_energy=remove_atomref_energy,
             )
         else:
-            shuffle = args.shuffle
-            (
-                train_dataset,
-                valid_dataset,
-                test_dataset,
-            ) = dataset.split_train_valid_test(
-                args.train_val_test_split, sort=False, shuffle=shuffle
-            )
+            if args.md22_protocol:
+                train_dataset, valid_dataset, test_dataset = _split_md22_protocol(
+                    dataset=dataset,
+                    dataset_name=dataset_name,
+                    data_path=data_path,
+                    args=args,
+                )
+            else:
+                shuffle = args.shuffle
+                (
+                    train_dataset,
+                    valid_dataset,
+                    test_dataset,
+                ) = dataset.split_train_valid_test(
+                    args.train_val_test_split, sort=False, shuffle=shuffle
+                )
             test_dataset_list.append(test_dataset)
             test_len += len(test_dataset)
         train_dataset_list.append(train_dataset)
@@ -447,7 +552,8 @@ def finetune(cfg: DictConfig) -> None:
     assert isinstance(args, SmallMolConfig)
 
 
-    # wandb_init(args)
+    if getattr(args, "wandb", False):
+        wandb_init(args)
     swanlab_init(args)
     seed_all(args.seed)
     set_env(args)

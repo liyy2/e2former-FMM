@@ -1,16 +1,9 @@
-# UBio-MolFM/E2Former-LSR
+# E2Former-FMM
 
-<p align="center">
-  <img src="./resources/main.png" alt="Architectural necessity and benchmark scope for long-range MLFFs" width="800"/>
-</p>
-
-This repo contains the code for the [Scalable Machine Learning Force Fields for Macromolecular Systems Through Long-Range Aware Message Passing](https://arxiv.org/abs/2601.03774).
-
-At its core, E2Former utilizes **Wigner 6j convolution** for efficient and accurate tensor product operations, enabling the model to capture complex geometric interactions while preserving physical symmetries. Besides, we developed E2former-LSR, a unified SO(3)-equivariant neural architecture that integrates Long–Short Range Message Passing (LSR-MP) with an E2Former backbone to capture both local and nonlocal interactions in molecular systems.
 
 ## Overview
 
-This repo contains the E2Former-LSR training pipeline, datasets utilities, and a runnable
+This repo contains the E2Former-FMM training pipeline, datasets utilities, and a runnable
 training entrypoint. The default training shell script is `scripts/train_e2former.sh`,
 which launches the Python entrypoint in `src/molfm/tasks/train_molfm.py`.
 
@@ -51,10 +44,55 @@ and can be overridden via environment variables.
 optimizer schedule, and E2Former backbone parameters. You can override values by exporting
 environment variables before invoking the script.
 
+Node-only FMM variant:
+
+- Use `config_file/backbone_config/e2former_fmm.yaml` as the Hydra backbone config.
+- This variant enables `attn_type: fmm-node` and `tp_type: fmm-node+tp_cueq`, which runs
+  node-based FMM attention without edge-neighbor attention construction and uses
+  cuEquivariance tensor-product kernels when available.
+- The default FMM radial band is configured by `fmm_num_kappa`, `fmm_kappa_min`,
+  and `fmm_kappa_max` in the same config; the shipped defaults prioritize lower
+  equivariance error at unchanged compute complexity.
+
+Hybrid short+long variant:
+
+- Use `config_file/backbone_config/e2former_hybrid.yaml`.
+- This runs local edge-based E2Former attention and global node-based FMM attention
+  in parallel and fuses them as `local + long_scale * global`.
+- Set `attn_type: hybrid-<local_type>` (for example `hybrid-first-order`).
+- Set `tp_type` as `<local_tp>@<fmm_tp>`; for example
+  `QK_alpha@fmm-node+tp_cueq`.
+
+MD22 baseline vs baseline+FFM protocol:
+
+- Use `scripts/train_md22_baseline_vs_hybrid.sh` to run both variants with identical
+  splits and optimization settings.
+- The split follows the LSR-MP style protocol: for each molecule, choose a
+  molecule-specific `sample_size`; split that subset into `train/val` by
+  `md22_train_prop` (default `0.95`), and use the remainder of the full dataset
+  as test.
+- Default molecule `sample_size` values are:
+  `AT_AT=3000`, `AT_AT_CG_CG=2000`, `stachyose=8000`, `DHA=8000`,
+  `Ac_Ala3_NHMe=6000`, `buckyball_catcher=600`,
+  `double_walled_nanotube=800`, `chig=8000`.
+- Override with `md22_sample_size=<int>` if needed.
+
+Example:
+
+```bash
+data_path=/path/to/md22 \
+data_path_list=chig/radius3/chig.lmdb \
+dataset_name_list=md \
+md22_molecule=chig \
+save_root=./outputs/md22_chig \
+bash scripts/train_md22_baseline_vs_hybrid.sh
+```
+
 ## Common Entry Points
 
 - `src/molfm/tasks/train_molfm.py`: main training entrypoint
 - `scripts/train_e2former_test.sh`: test training launcher
+- `scripts/benchmark_e2former_fmm_variant.py`: baseline edge-attention vs node-only FMM speed benchmark
 
 ## Data and Checkpoints
 
