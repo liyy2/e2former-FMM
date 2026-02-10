@@ -384,6 +384,36 @@ class MOLFMModel_Atomic(CoreModule):
             if key.startswith("net."):
                 checkpoints_state[key[4:]] = checkpoints_state.pop(key)
 
+        # Warm-start Hybrid attention from a baseline checkpoint:
+        # Baseline E2Former uses `blocks.*.ga.*` while Hybrid wraps the same local
+        # attention as `blocks.*.ga.local_attn.*`. Remap those keys when possible.
+        model_state = self.state_dict()
+        if any(".ga.local_attn." in k for k in model_state.keys()):
+            remapped = {}
+            to_delete = []
+            for k, v in list(checkpoints_state.items()):
+                if (
+                    ".ga." in k
+                    and ".ga.local_attn." not in k
+                    and ".ga.global_attn." not in k
+                ):
+                    k_local = k.replace(".ga.", ".ga.local_attn.", 1)
+                    if (
+                        k_local in model_state
+                        and isinstance(v, torch.Tensor)
+                        and model_state[k_local].shape == v.shape
+                    ):
+                        remapped[k_local] = v
+                        to_delete.append(k)
+            if remapped:
+                for k in to_delete:
+                    checkpoints_state.pop(k, None)
+                checkpoints_state.update(remapped)
+                logger.info(
+                    "Remapped {} baseline attention keys to Hybrid local attention keys.",
+                    len(remapped),
+                )
+
         IncompatibleKeys = self.load_state_dict(checkpoints_state, strict=False)
         IncompatibleKeys = IncompatibleKeys._asdict()
 

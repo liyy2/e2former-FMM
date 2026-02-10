@@ -29,9 +29,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-INTERVAL="600"
+INTERVAL="1200"
 ONCE="0"
-STATE_DIR="${HOME}/.codexmon"
+STATE_DIR=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
 MASTER_PROMPT=""
@@ -51,11 +51,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "$STATE_DIR" ]]; then
+  # Default state directory lives inside the repo (and under outputs/ which is gitignored).
+  STATE_DIR="${REPO_ROOT}/outputs/codex_monitor"
+fi
+
 mkdir -p "$STATE_DIR"
 
 STATE="$STATE_DIR/state.json"
 REPORT="$STATE_DIR/report.json"
-ALERTS_LOG="$STATE_DIR/alerts.log"
 
 CODEX_CMD="${CODEX_CMD:-codex}"
 CODEX_ARGS="${CODEX_ARGS:---dangerously-bypass-approvals-and-sandbox}"
@@ -82,7 +86,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 init_state() {
   [[ -f "$STATE" ]] && return
   cat > "$STATE" <<'JSON'
-{"last_summary":"","last_alert_level":"none","last_prompt_ts":0,"call_count":0}
+{"last_summary":"","last_recommendation":"","last_prompt_ts":0,"call_count":0}
 JSON
 }
 
@@ -93,9 +97,9 @@ read_state() {
 write_state() {
   python3 - "$STATE" "$1" "$2" "$3" "$4" <<'PY'
 import json, sys
-f, summary, alert, ts, calls = sys.argv[1:]
+f, summary, recommendation, ts, calls = sys.argv[1:]
 s = json.load(open(f))
-s.update({"last_summary": summary, "last_alert_level": alert,
+s.update({"last_summary": summary, "last_recommendation": recommendation,
           "last_prompt_ts": int(ts), "call_count": int(calls)})
 json.dump(s, open(f, "w"))
 PY
@@ -144,15 +148,12 @@ ensure_slack_channel() {
     --data-urlencode "text=codex_monitor: online" \
     "https://slack.com/api/chat.postMessage" || true)"
 
-  channel_id="$(python3 - <<'PY' <<<"$resp"
-import json, sys
+  channel_id="$(python3 -c 'import json,sys
 try:
-    d = json.load(sys.stdin)
+    d = json.loads(sys.stdin.read() or "{}")
     print(d.get("channel", "") or "")
 except Exception:
-    print("")
-PY
-)"
+    print("")' <<<"$resp" 2>/dev/null || true)"
 
   if [[ -n "$channel_id" ]]; then
     SLACK_CHANNEL="$channel_id"
@@ -171,15 +172,21 @@ slack_bot_identity() {
     return 0
   fi
 
+  # If IDs are already provided (via env/defaults), persist them and skip the API call.
+  if [[ -n "${SLACK_BOT_USER_ID:-}" && -n "${SLACK_BOT_ID:-}" ]]; then
+    echo "$SLACK_BOT_USER_ID" > "$cache_dir/bot_user_id"
+    echo "$SLACK_BOT_ID" > "$cache_dir/bot_id"
+    return 0
+  fi
+
   local resp
   resp="$(curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
     "https://slack.com/api/auth.test" || true)"
 
-  python3 - "$cache_dir" <<'PY' <<<"$resp"
-import json, os, sys
+  python3 -c 'import json, os, sys
 cache_dir = sys.argv[1]
 try:
-    d = json.load(sys.stdin)
+    d = json.loads(sys.stdin.read() or "{}")
 except Exception:
     d = {}
 user_id = d.get("user_id") or ""
@@ -190,14 +197,18 @@ if user_id:
 if bot_id:
     with open(os.path.join(cache_dir, "bot_id"), "w") as f:
         f.write(bot_id)
-PY
+' "$cache_dir" <<<"$resp" >/dev/null 2>&1 || true
 }
 
 default_master_prompt() {
   cat <<'EOF'
 You are Codex acting as an autonomous MD22 experiment operator in this repository.
-Primary goal: reach strong MD22 results while keeping experiments healthy.
-
+Primary goal: reach strong MD22 results while keeping experiments healthy. Never stop experiments unless they are unhealthy. 
+A typical experiment takes 1-2 days to complete. Another rule is that you should tune the FMM variant (hybrid or long-range) to surpass the baseline (short-range).
+Launch as many experiments as possible to reach the goal.
+You should always check the status of the experiments before making any decisions.
+also minimize resume from checkpoint. try to start from scratch if possible.
+try to use distributed training to speed up the training if possible.
 At each cycle:
 1) Check active SLURM jobs and recent logs (outputs/slurm and wandb local logs).
 2) Assess run health (healthy / stalled / diverging / crashed).
@@ -207,7 +218,7 @@ At each cycle:
 6) Treat the "User Feedback" section as high-priority steering instructions from the user.
 
 Return exactly one JSON object on one line at the end:
-{"alert_level":"none|info|warning|critical","summary":"...","recommendation":"..."}
+{"summary":"...","recommendation":"..."}
 EOF
 }
 
@@ -220,7 +231,7 @@ load_master_prompt() {
 }
 
 build_prompt() {
-  local prior_summary="$1" prior_alert="$2" call_count="$3"
+  local prior_summary="$1" prior_recommendation="$2" call_count="$3"
 
   local master_content
   master_content="$(load_master_prompt)"
@@ -252,10 +263,10 @@ $feedback
 }---
 
 Return exactly one line of JSON:
-{"alert_level":"none|info|warning|critical","summary":"...","recommendation":"what to do next or try in next run"}
+{"summary":"...","recommendation":"what to do next or try in next run"}
 
 Prior summary: $prior_summary
-Prior alert: $prior_alert
+Prior recommendation: $prior_recommendation
 Call count: $call_count / $MAX_CALLS
 EOF
 }
@@ -271,7 +282,7 @@ job_snapshot() {
   fi
 
   local filtered
-  filtered="$(echo "$sq" | awk 'NR==1{print; next} {print}' | { head -n1; tail -n +2 | rg -E "$JOB_NAME_REGEX" || true; })"
+  filtered="$(echo "$sq" | awk 'NR==1{print; next} {print}' | { head -n1; tail -n +2 | rg -e "$JOB_NAME_REGEX" || true; })"
   if [[ -z "$filtered" ]]; then
     echo "(no matching jobs; regex: $JOB_NAME_REGEX)"
     return 0
@@ -359,13 +370,13 @@ if text:
 for candidate in reversed(candidates):
     try:
         obj = json.loads(candidate)
-        if "alert_level" in obj and "summary" in obj:
+        if "summary" in obj:
             print(json.dumps(obj, ensure_ascii=False))
             sys.exit(0)
     except Exception:
         pass
 
-print('{"alert_level":"info","summary":"(no valid JSON)","recommendation":""}')
+print('{"summary":"(no valid JSON)","recommendation":""}')
 PY
 }
 
@@ -375,12 +386,56 @@ get_json_field() {
 
 send_slack() {
   local message="$1"
-  # Use bot token to post to DM/channel
+  # Use bot token to post to DM/channel.
+  #
+  # IMPORTANT: Do not interpolate raw multi-line strings into JSON in bash.
+  # Use Python to JSON-encode the message so newlines/quotes are escaped.
   if [[ -n "$SLACK_BOT_TOKEN" && -n "$SLACK_CHANNEL" ]]; then
-    curl -s -X POST -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-      -H 'Content-type: application/json' \
-      --data "{\"channel\":\"$SLACK_CHANNEL\",\"text\":\"$message\"}" \
-      "https://slack.com/api/chat.postMessage" >/dev/null 2>&1 || true
+    python3 - "$STATE_DIR" "$SLACK_CHANNEL" "$message" <<'PY' >/dev/null 2>&1 || true
+import datetime
+import json
+import os
+import sys
+import urllib.request
+
+state_dir, channel, text = sys.argv[1], sys.argv[2], sys.argv[3]
+token = os.environ.get("SLACK_BOT_TOKEN", "")
+
+if not token or not channel:
+    raise SystemExit(0)
+
+payload = json.dumps({"channel": channel, "text": text}).encode("utf-8")
+req = urllib.request.Request(
+    "https://slack.com/api/chat.postMessage",
+    data=payload,
+    headers={
+        "Authorization": f"Bearer {token}",
+        "Content-type": "application/json",
+    },
+)
+
+try:
+    with urllib.request.urlopen(req, timeout=20) as r:
+        resp = json.loads(r.read().decode("utf-8"))
+except Exception as e:
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "slack_send.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.datetime.now().isoformat()}] exception: {e}\n")
+    except Exception:
+        pass
+    raise SystemExit(0)
+
+if not resp.get("ok"):
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "slack_send.log"), "a", encoding="utf-8") as f:
+            f.write(
+                f"[{datetime.datetime.now().isoformat()}] ok=false error={resp.get('error')}\n"
+            )
+    except Exception:
+        pass
+PY
   fi
 }
 
@@ -447,7 +502,7 @@ while true; do
   slack_bot_identity
 
   last_summary="$(read_state last_summary)"
-  last_alert="$(read_state last_alert_level)"
+  last_recommendation="$(read_state last_recommendation)"
   last_prompt_ts="$(read_state last_prompt_ts)"
   call_count="$(read_state call_count)"
 
@@ -461,13 +516,18 @@ while true; do
   now_ts="$(date +%s)"
 
   # Build prompt and call Codex
-  build_prompt "$last_summary" "$last_alert" "$call_count"
+  build_prompt "$last_summary" "$last_recommendation" "$call_count"
   
   # Emit a concise status snapshot to Slack before running Codex.
   if [[ -n "$SLACK_BOT_TOKEN" && -n "$SLACK_CHANNEL" ]]; then
     status="$(cat "$TMP_DIR/status.txt" 2>/dev/null || true)"
     feedback_preview="$(cat "$TMP_DIR/feedback.txt" 2>/dev/null || true)"
-    send_slack "📡 [Monitor #$((call_count + 1))] Status snapshot\n${status}\n\nNew steering (if any):\n${feedback_preview:-<none>}"
+    slack_msg=""
+    printf -v slack_msg "📡 [Monitor #%s] Status snapshot\n%s\n\nNew steering (if any):\n%s" \
+      "$((call_count + 1))" \
+      "${status:-<empty>}" \
+      "${feedback_preview:-<none>}"
+    send_slack "$slack_msg"
   fi
   
   run_codex
@@ -475,15 +535,8 @@ while true; do
   call_count=$(( call_count + 1 ))
 
   # Extract response fields
-  alert_level="$(get_json_field alert_level)"
   summary="$(get_json_field summary)"
   recommendation="$(get_json_field recommendation)"
-
-  # Log alerts and recommendations
-  if [[ "$alert_level" == "warning" || "$alert_level" == "critical" ]]; then
-    echo "[$(date)] $alert_level: $summary" >> "$ALERTS_LOG"
-    [[ -n "$recommendation" ]] && echo "  -> $recommendation" >> "$ALERTS_LOG"
-  fi
 
   # Always log recommendation to a separate file
   if [[ -n "$recommendation" ]]; then
@@ -491,10 +544,12 @@ while true; do
   fi
 
   # Send Slack notification (Codex decision)
-  send_slack "[Monitor #$call_count] $alert_level: $summary\nNext: $recommendation"
+  slack_msg=""
+  printf -v slack_msg "[Monitor #%s] %s\nNext: %s" "$call_count" "$summary" "$recommendation"
+  send_slack "$slack_msg"
 
   # Update state
-  write_state "$summary" "$alert_level" "$now_ts" "$call_count"
+  write_state "$summary" "$recommendation" "$now_ts" "$call_count"
 
   # Single iteration mode
   [[ "$ONCE" == "1" ]] && exit 0

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import math
+import re
 import warnings
 from typing import Dict, Optional
 
@@ -806,6 +807,9 @@ class E2AttentionHybridShortLong(torch.nn.Module):
         fmm_num_kappa: int = 8,
         fmm_kappa_min: float = 1.0,
         fmm_kappa_max: float = 1.4,
+        fmm_num_directions: int = 25,
+        fmm_kappa_chunk_size: int = 0,
+        fmm_compute_dtype: str | None = "auto",
         hybrid_long_scale_init: float = 1.0,
         **kwargs,
     ):
@@ -858,6 +862,9 @@ class E2AttentionHybridShortLong(torch.nn.Module):
             fmm_num_kappa=fmm_num_kappa,
             fmm_kappa_min=fmm_kappa_min,
             fmm_kappa_max=fmm_kappa_max,
+            fmm_num_directions=fmm_num_directions,
+            fmm_kappa_chunk_size=fmm_kappa_chunk_size,
+            fmm_compute_dtype=fmm_compute_dtype,
             **kwargs,
         )
         self.long_scale = nn.Parameter(
@@ -1054,6 +1061,9 @@ class TransBlock(torch.nn.Module):
         fmm_num_kappa: int = 8,
         fmm_kappa_min: float = 1.0,
         fmm_kappa_max: float = 1.4,
+        fmm_num_directions: int = 25,
+        fmm_kappa_chunk_size: int = 0,
+        fmm_compute_dtype: str | None = "auto",
         hybrid_long_scale_init: float = 1.0,
     ):
         super().__init__()
@@ -1079,14 +1089,35 @@ class TransBlock(torch.nn.Module):
         self.layer_id = layer_id
         func = None
 
-        if "+" in attn_type:
-            attn_type = attn_type.split("+")
-            if layer_id >= int(attn_type[0][-1]) + int(attn_type[1][-1]):
-                raise ValueError("sorry you attn type is bigger than layer id")
-            if layer_id < int(attn_type[0][-1]):
-                attn_type = attn_type[0][:-1]
-            else:
-                attn_type = attn_type[1][:-1]
+        # Support serial schedules such as "first-order6+fmm-node2" to run local
+        # attention in early layers and FMM-node attention in later layers.
+        if isinstance(attn_type, str) and "+" in attn_type:
+            parts = [part.strip() for part in attn_type.split("+") if part.strip()]
+            if len(parts) != 2:
+                raise ValueError(
+                    "Serial attn_type schedule must have exactly two parts, e.g. "
+                    "'first-order6+fmm-node2'. Got: {!r}".format(attn_type)
+                )
+
+            def _parse_part(text: str) -> tuple[str, int]:
+                match = re.match(r"^(?P<kind>.+?)(?P<count>\d+)$", text)
+                if not match:
+                    raise ValueError(
+                        "Each serial attn_type part must end with an integer layer count, "
+                        "e.g. 'first-order6'. Got: {!r} (from {!r})".format(text, attn_type)
+                    )
+                kind = match.group("kind")
+                count = int(match.group("count"))
+                return kind, count
+
+            kind_0, n_0 = _parse_part(parts[0])
+            kind_1, n_1 = _parse_part(parts[1])
+            if layer_id >= n_0 + n_1:
+                raise ValueError(
+                    "Serial attn_type schedule exceeds configured num_layers: "
+                    f"layer_id={layer_id}, schedule={attn_type!r} implies {n_0 + n_1} layers."
+                )
+            attn_type = kind_0 if layer_id < n_0 else kind_1
 
         self.attn_type = attn_type
 
@@ -1128,6 +1159,9 @@ class TransBlock(torch.nn.Module):
             fmm_num_kappa=fmm_num_kappa,
             fmm_kappa_min=fmm_kappa_min,
             fmm_kappa_max=fmm_kappa_max,
+            fmm_num_directions=fmm_num_directions,
+            fmm_kappa_chunk_size=fmm_kappa_chunk_size,
+            fmm_compute_dtype=fmm_compute_dtype,
             hybrid_long_scale_init=hybrid_long_scale_init,
         )
 
@@ -3030,6 +3064,9 @@ class E2former(torch.nn.Module):
         self.fmm_num_kappa = int(kwargs.pop("fmm_num_kappa", 8))
         self.fmm_kappa_min = float(kwargs.pop("fmm_kappa_min", 1.0))
         self.fmm_kappa_max = float(kwargs.pop("fmm_kappa_max", 1.4))
+        self.fmm_num_directions = int(kwargs.pop("fmm_num_directions", 25))
+        self.fmm_kappa_chunk_size = int(kwargs.pop("fmm_kappa_chunk_size", 0))
+        self.fmm_compute_dtype = kwargs.pop("fmm_compute_dtype", "auto")
         self.hybrid_long_scale_init = float(kwargs.pop("hybrid_long_scale_init", 1.0))
         if self.node_only_attention and self.decouple_EF:
             raise ValueError(
@@ -3129,6 +3166,9 @@ class E2former(torch.nn.Module):
                 fmm_num_kappa=self.fmm_num_kappa,
                 fmm_kappa_min=self.fmm_kappa_min,
                 fmm_kappa_max=self.fmm_kappa_max,
+                fmm_num_directions=self.fmm_num_directions,
+                fmm_kappa_chunk_size=self.fmm_kappa_chunk_size,
+                fmm_compute_dtype=self.fmm_compute_dtype,
                 hybrid_long_scale_init=self.hybrid_long_scale_init,
             )
             self.blocks.append(blk)
@@ -3158,6 +3198,9 @@ class E2former(torch.nn.Module):
                 fmm_num_kappa=self.fmm_num_kappa,
                 fmm_kappa_min=self.fmm_kappa_min,
                 fmm_kappa_max=self.fmm_kappa_max,
+                fmm_num_directions=self.fmm_num_directions,
+                fmm_kappa_chunk_size=self.fmm_kappa_chunk_size,
+                fmm_compute_dtype=self.fmm_compute_dtype,
                 hybrid_long_scale_init=self.hybrid_long_scale_init,
             )
 

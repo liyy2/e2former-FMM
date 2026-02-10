@@ -57,6 +57,65 @@ def _parse_args() -> argparse.Namespace:
         choices=["auto", "e3nn", "cueq"],
         help="Tensor-product backend for fmm-node attention.",
     )
+    parser.add_argument(
+        "--include-hybrid",
+        action="store_true",
+        help="Also benchmark the hybrid short-range+long-range (FMM) variant.",
+    )
+    parser.add_argument(
+        "--include-serial",
+        action="store_true",
+        help=(
+            "Also benchmark a serial short->long schedule such as "
+            "'first-order{K}+fmm-node{L}' (residual connections happen between blocks)."
+        ),
+    )
+    parser.add_argument(
+        "--serial-local-layers",
+        type=int,
+        default=None,
+        help=(
+            "Number of early layers using local edge attention for --include-serial. "
+            "The remaining layers use fmm-node attention. Default: layers//2."
+        ),
+    )
+    parser.add_argument(
+        "--fmm-num-kappa",
+        type=int,
+        default=6,
+        help="Number of kappa frequencies for fmm-node/hybrid variants.",
+    )
+    parser.add_argument(
+        "--fmm-kappa-min",
+        type=float,
+        default=0.8,
+        help="Minimum kappa for fmm-node/hybrid variants.",
+    )
+    parser.add_argument(
+        "--fmm-kappa-max",
+        type=float,
+        default=1.2,
+        help="Maximum kappa for fmm-node/hybrid variants.",
+    )
+    parser.add_argument(
+        "--fmm-num-directions",
+        type=int,
+        default=25,
+        help="Number of sphere quadrature directions for fmm-node/hybrid variants.",
+    )
+    parser.add_argument(
+        "--fmm-kappa-chunk-size",
+        type=int,
+        default=0,
+        help="Kappa chunk size for the FMM core. 0=auto, smaller can reduce peak memory.",
+    )
+    parser.add_argument(
+        "--fmm-compute-dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "fp32", "bf16", "fp16"],
+        help="Optional low-precision compute dtype for the FMM core.",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
@@ -161,6 +220,12 @@ def main() -> None:
     fmm_node = E2former(
         tp_type=fmm_tp_type,
         attn_type="fmm-node",
+        fmm_num_kappa=args.fmm_num_kappa,
+        fmm_kappa_min=args.fmm_kappa_min,
+        fmm_kappa_max=args.fmm_kappa_max,
+        fmm_num_directions=args.fmm_num_directions,
+        fmm_kappa_chunk_size=args.fmm_kappa_chunk_size,
+        fmm_compute_dtype=args.fmm_compute_dtype,
         **common,
     ).to(device)
 
@@ -175,11 +240,66 @@ def main() -> None:
     print(
         f"device={device} B={args.B} num_nodes={nodes_per_graph} layers={args.layers} "
         f"max_neighbors={args.max_neighbors} radius={args.radius} pos_scale={args.pos_scale} "
-        f"fmm_tp_backend={args.fmm_tp_backend}"
+        f"fmm_tp_backend={args.fmm_tp_backend} "
+        f"fmm_num_kappa={args.fmm_num_kappa} kappa=[{args.fmm_kappa_min},{args.fmm_kappa_max}]"
     )
     print(f"baseline(edge) forward: {t_baseline * 1e3:.3f} ms")
     print(f"fmm-node forward:       {t_fmm_node * 1e3:.3f} ms")
     print(f"speedup baseline/fmm:   {t_baseline / max(t_fmm_node, 1e-12):.2f}x")
+
+    if args.include_hybrid:
+        hybrid = E2former(
+            tp_type=f"QK_alpha@{fmm_tp_type}",
+            attn_type="hybrid-first-order",
+            fmm_num_kappa=args.fmm_num_kappa,
+            fmm_kappa_min=args.fmm_kappa_min,
+            fmm_kappa_max=args.fmm_kappa_max,
+            fmm_num_directions=args.fmm_num_directions,
+            fmm_kappa_chunk_size=args.fmm_kappa_chunk_size,
+            fmm_compute_dtype=args.fmm_compute_dtype,
+            **common,
+        ).to(device)
+        t_hybrid = _time_forward(
+            hybrid, batched_data, padding_mask, warmup=args.warmup, iters=args.iters
+        )
+        print(f"hybrid(local+fmm) forward: {t_hybrid * 1e3:.3f} ms")
+        print(f"slowdown hybrid/baseline:  {t_hybrid / max(t_baseline, 1e-12):.2f}x")
+
+    if args.include_serial:
+        local_layers = args.serial_local_layers
+        if local_layers is None:
+            local_layers = max(1, int(args.layers) // 2)
+        local_layers = int(local_layers)
+        if local_layers <= 0 or local_layers >= int(args.layers):
+            raise ValueError(
+                f"serial_local_layers must be in [1, layers-1], got {local_layers} with layers={args.layers}"
+            )
+        global_layers = int(args.layers) - local_layers
+
+        # `tp_type` is shared across blocks. We pass a value that:
+        # - keeps local blocks on QK_alpha (local module reads the first '+' token),
+        # - requests cuequivariance CG coupling for fmm-node blocks (fmm module looks for '+tp_cueq').
+        serial_tp = "QK_alpha+tp_e3nn" if args.fmm_tp_backend == "e3nn" else "QK_alpha+tp_cueq"
+        serial = E2former(
+            tp_type=serial_tp,
+            attn_type=f"first-order{local_layers}+fmm-node{global_layers}",
+            fmm_num_kappa=args.fmm_num_kappa,
+            fmm_kappa_min=args.fmm_kappa_min,
+            fmm_kappa_max=args.fmm_kappa_max,
+            fmm_num_directions=args.fmm_num_directions,
+            fmm_kappa_chunk_size=args.fmm_kappa_chunk_size,
+            fmm_compute_dtype=args.fmm_compute_dtype,
+            **common,
+        ).to(device)
+        t_serial = _time_forward(
+            serial, batched_data, padding_mask, warmup=args.warmup, iters=args.iters
+        )
+        print(
+            f"serial(first-order{local_layers}+fmm-node{global_layers}) forward: {t_serial * 1e3:.3f} ms"
+        )
+        print(f"slowdown serial/baseline:  {t_serial / max(t_baseline, 1e-12):.2f}x")
+        if args.include_hybrid:
+            print(f"speedup serial/hybrid:    {t_hybrid / max(t_serial, 1e-12):.2f}x")
 
 
 if __name__ == "__main__":

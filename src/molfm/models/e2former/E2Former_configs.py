@@ -135,9 +135,17 @@ class E2FormerBackboneConfigs:
     sparse_attn: bool
     dynamic_sparse_attn_threthod: int
     force_head: Any
-    cluster_ckpt_path: str
-    with_cluster: bool
-    use_rdkit: bool
+    # FMM/hybrid-only knobs (safe defaults for baseline attention types).
+    fmm_num_kappa: int = 8
+    fmm_kappa_min: float = 1.0
+    fmm_kappa_max: float = 1.4
+    fmm_num_directions: int = 25
+    fmm_kappa_chunk_size: int = 0
+    fmm_compute_dtype: str = "auto"  # auto|fp32|bf16|fp16
+    hybrid_long_scale_init: float = 1.0
+    cluster_ckpt_path: str = ""
+    with_cluster: bool = False
+    use_rdkit: bool = False
 
 @dataclass
 class E2FormerConfigs:

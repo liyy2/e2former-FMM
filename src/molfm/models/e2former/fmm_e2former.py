@@ -129,6 +129,9 @@ class E2AttentionNodeFMM(nn.Module):
         fmm_num_kappa: int = 8,
         fmm_kappa_min: float = 1.0,
         fmm_kappa_max: float = 1.4,
+        fmm_num_directions: int = 25,
+        fmm_kappa_chunk_size: int = 0,
+        fmm_compute_dtype: str | None = "auto",
         **kwargs,
     ):
         super().__init__()
@@ -235,6 +238,8 @@ class E2AttentionNodeFMM(nn.Module):
             float(num_kappa)
         )
 
+        self.fmm_compute_dtype = fmm_compute_dtype
+
         # AlphaFRYSphericalFMMMultiL computes the FMM expansion for ALL degrees
         # l=0..lmax simultaneously, sharing expensive work (phase computation,
         # moment formation, query projection) and only branching at the final
@@ -251,10 +256,10 @@ class E2AttentionNodeFMM(nn.Module):
             l_values=list(range(self.lmax + 1)),
             kappa=kappa,
             a=a,
-            num_directions=25,
+            num_directions=int(fmm_num_directions),
             sphere="gauss_legendre",
             phase_mode="trig",
-            kappa_chunk_size=0,
+            kappa_chunk_size=int(fmm_kappa_chunk_size),
             promote_half_precision=False,
             optimize_low_precision_sphere=True,
         )
@@ -404,7 +409,7 @@ class E2AttentionNodeFMM(nn.Module):
         node_pos: torch.Tensor,
         node_irreps: torch.Tensor,
         batch: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
         """Convert flat node tensors into padded per-graph batches.
 
         E2Former (and PyG in general) stores all nodes from all graphs in a single
@@ -425,8 +430,12 @@ class E2AttentionNodeFMM(nn.Module):
             packed_pos:    (B, max_nodes, 3) padded positions (zeros for padding).
             packed_irreps: (B, max_nodes, (lmax+1)^2, C) padded irreps.
             packed_mask:   (B, max_nodes) bool mask, True = real node.
-            node_indices:  list of B tensors, each containing the flat indices of
-                           nodes belonging to graph g. Used by _unpack_by_graph.
+            pack_info:     Opaque packing metadata consumed by _unpack_by_graph.
+                           If the input `batch` is nondecreasing (common in this repo),
+                           we use a fast scatter-based packing path and store
+                           (mode, batch, idx_in_graph). Otherwise we fall back to
+                           the original per-graph `nonzero` indexing and store
+                           (mode, node_indices).
         """
         num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
         counts = torch.bincount(batch, minlength=num_graphs)
@@ -439,8 +448,28 @@ class E2AttentionNodeFMM(nn.Module):
         packed_mask = torch.zeros(
             (num_graphs, max_nodes), dtype=torch.bool, device=node_pos.device
         )
-        node_indices: list[torch.Tensor] = []
 
+        # Fast path: in this repo, `batch` is typically nondecreasing because we
+        # flatten padded (B,L,...) tensors with a boolean mask. Avoiding per-graph
+        # `nonzero` calls removes a noticeable CPU/GPU synchronization bottleneck.
+        batch_sorted = True
+        if batch.numel() > 1:
+            batch_sorted = bool((batch[1:] >= batch[:-1]).all().item())
+        if batch_sorted:
+            # start[g] = starting flat index of graph g in the nondecreasing layout
+            start = torch.zeros((num_graphs,), device=batch.device, dtype=torch.long)
+            if num_graphs > 1:
+                start[1:] = counts.cumsum(dim=0)[:-1]
+            idx_in_graph = torch.arange(batch.numel(), device=batch.device, dtype=torch.long)
+            idx_in_graph = idx_in_graph - start[batch]
+            packed_pos[batch, idx_in_graph] = node_pos
+            packed_irreps[batch, idx_in_graph] = node_irreps
+            packed_mask[batch, idx_in_graph] = True
+            pack_info = ("sorted_batch", batch, idx_in_graph)
+            return packed_pos, packed_irreps, packed_mask, pack_info
+
+        # Fallback: general (unsorted) batch layouts.
+        node_indices: list[torch.Tensor] = []
         for graph_id in range(num_graphs):
             idx = torch.nonzero(batch == graph_id, as_tuple=False).squeeze(-1)
             node_indices.append(idx)
@@ -449,12 +478,13 @@ class E2AttentionNodeFMM(nn.Module):
             packed_pos[graph_id, : idx.numel()] = node_pos[idx]
             packed_irreps[graph_id, : idx.numel()] = node_irreps[idx]
             packed_mask[graph_id, : idx.numel()] = True
-        return packed_pos, packed_irreps, packed_mask, node_indices
+        pack_info = ("indices", node_indices)
+        return packed_pos, packed_irreps, packed_mask, pack_info
 
     @staticmethod
     def _unpack_by_graph(
         packed_output: torch.Tensor,
-        node_indices: list[torch.Tensor],
+        pack_info: tuple,
         n_nodes: int,
     ) -> torch.Tensor:
         """Scatter padded per-graph output back to flat node indexing.
@@ -465,20 +495,33 @@ class E2AttentionNodeFMM(nn.Module):
 
         Args:
             packed_output: (B, max_nodes, (lmax+1)^2, C) padded output.
-            node_indices:  per-graph index lists from _pack_by_graph.
+            pack_info:     packing metadata from _pack_by_graph.
             n_nodes:       total number of nodes N (to allocate output).
 
         Returns:
             (N, (lmax+1)^2, C) flat output tensor.
         """
-        out = packed_output.new_zeros(
-            (n_nodes, packed_output.shape[2], packed_output.shape[3])
-        )
-        for graph_id, idx in enumerate(node_indices):
-            if idx.numel() == 0:
-                continue
-            out[idx] = packed_output[graph_id, : idx.numel()]
-        return out
+        mode = str(pack_info[0])
+        if mode == "sorted_batch":
+            _, batch, idx_in_graph = pack_info
+            if int(batch.numel()) != int(n_nodes):
+                raise ValueError(
+                    f"pack_info batch length {int(batch.numel())} must match n_nodes={int(n_nodes)}"
+                )
+            return packed_output[batch, idx_in_graph]
+
+        if mode == "indices":
+            _, node_indices = pack_info
+            out = packed_output.new_zeros(
+                (n_nodes, packed_output.shape[2], packed_output.shape[3])
+            )
+            for graph_id, idx in enumerate(node_indices):
+                if idx.numel() == 0:
+                    continue
+                out[idx] = packed_output[graph_id, : idx.numel()]
+            return out
+
+        raise ValueError(f"Unknown pack_info mode {mode!r}")
 
     @staticmethod
     def _l_slice(order_l: int) -> tuple[int, int]:
@@ -657,7 +700,7 @@ class E2AttentionNodeFMM(nn.Module):
         # =====================================================================
         # Convert from flat (N, ...) to padded (B, max_nodes, ...) layout.
         # The FMM core requires regular tensor shapes for batched computation.
-        packed_pos, packed_irreps, packed_mask, node_indices = self._pack_by_graph(
+        packed_pos, packed_irreps, packed_mask, pack_info = self._pack_by_graph(
             node_pos=node_pos,
             node_irreps=node_irreps_input,
             batch=batch,
@@ -723,8 +766,23 @@ class E2AttentionNodeFMM(nn.Module):
         # Returns a list of tensors, one per ell:
         #   out_by_ell[ell] has shape (B, max_nodes, H, (2*ell+1) * Q * Cv)
         #   (from the FMM core's perspective, the last dim is just "value features")
+        fmm_pos = packed_pos
+        if self.fmm_compute_dtype is not None and isinstance(self.fmm_compute_dtype, str):
+            token = self.fmm_compute_dtype.strip().lower()
+            if token not in ("", "auto", "fp32", "float32", "bf16", "bfloat16", "fp16", "float16", "half"):
+                raise ValueError(
+                    "fmm_compute_dtype must be one of {'auto','fp32','bf16','fp16'} "
+                    f"(or synonymous strings), got {self.fmm_compute_dtype!r}."
+                )
+            if token in ("bf16", "bfloat16"):
+                fmm_pos = fmm_pos.to(dtype=torch.bfloat16)
+            elif token in ("fp16", "float16", "half"):
+                fmm_pos = fmm_pos.to(dtype=torch.float16)
+            elif token in ("fp32", "float32"):
+                fmm_pos = fmm_pos.to(dtype=torch.float32)
+
         out_by_ell = self.fmm_multi_l(
-            packed_pos,
+            fmm_pos,
             q,
             k,
             v_all_flat,
@@ -844,7 +902,7 @@ class E2AttentionNodeFMM(nn.Module):
         # Convert from (B, max_nodes, (lmax+1)^2, C) back to (N, (lmax+1)^2, C).
         node_output = self._unpack_by_graph(
             packed_output=packed_out,
-            node_indices=node_indices,
+            pack_info=pack_info,
             n_nodes=node_irreps_input.shape[0],
         )
         # Return (output, attn_weight) to match the original E2Former attention interface.

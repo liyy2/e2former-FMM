@@ -48,6 +48,10 @@ tp_type: "QK_alpha@fmm-node+tp_cueq"
 fmm_num_kappa: 8
 fmm_kappa_min: 1.0
 fmm_kappa_max: 1.4
+# FMM speed/accuracy knobs (used by fmm-node blocks in hybrid/serial schedules)
+fmm_num_directions: 25
+fmm_kappa_chunk_size: 0
+fmm_compute_dtype: "auto" # auto|fp32|bf16|fp16
 hybrid_long_scale_init: 1.0
 edge_embedtype: "eqv2"
 attn_biastype: "share"

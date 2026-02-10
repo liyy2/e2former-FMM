@@ -2,7 +2,7 @@
 #SBATCH --job-name=dwnt_e2former
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=120G
 #SBATCH --time=47:00:00
 #SBATCH --output=outputs/slurm/%x-%j.out
@@ -39,7 +39,8 @@ MIN_LR="${MIN_LR:-1e-5}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-5e-3}"
 SEED="${SEED:-48}"
-MASTER_PORT="${MASTER_PORT:-29621}"
+# Avoid collisions when multiple jobs share a node.
+MASTER_PORT="${MASTER_PORT:-$((20000 + (${SLURM_JOB_ID:-0} % 20000)))}"
 WANDB_ENABLE="${WANDB_ENABLE:-True}"
 WANDB_PROJECT="${WANDB_PROJECT:-ffm}"
 WANDB_GROUP="${WANDB_GROUP:-md22_dwnt}"

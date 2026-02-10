@@ -46,6 +46,10 @@ tp_type : "fmm-node+tp_cueq"
 fmm_num_kappa: 8
 fmm_kappa_min: 1.0
 fmm_kappa_max: 1.4
+# FMM speed/accuracy knobs
+fmm_num_directions: 25
+fmm_kappa_chunk_size: 0
+fmm_compute_dtype: "auto" # auto|fp32|bf16|fp16
 edge_embedtype: "eqv2"
 attn_biastype: "share"
 ffn_type: "eqv2ffn"

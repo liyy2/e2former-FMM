@@ -2,7 +2,7 @@
 #SBATCH --job-name=dwnt_e2former_fmm
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=120G
 #SBATCH --time=47:00:00
 #SBATCH --output=outputs/slurm/%x-%j.out
@@ -38,12 +38,13 @@ TOTAL_NUM_EPOCHS="${TOTAL_NUM_EPOCHS:-3000}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-2}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
-MAX_LR="${MAX_LR:-1e-4}"
-MIN_LR="${MIN_LR:-1e-5}"
+MAX_LR="${MAX_LR:-5e-5}"
+MIN_LR="${MIN_LR:-5e-6}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-5e-3}"
 SEED="${SEED:-48}"
-MASTER_PORT="${MASTER_PORT:-29622}"
+# Avoid collisions when multiple jobs share a node.
+MASTER_PORT="${MASTER_PORT:-$((20000 + (${SLURM_JOB_ID:-0} % 20000)))}"
 WANDB_ENABLE="${WANDB_ENABLE:-True}"
 WANDB_PROJECT="${WANDB_PROJECT:-ffm}"
 WANDB_GROUP="${WANDB_GROUP:-md22_dwnt}"
@@ -51,6 +52,7 @@ WANDB_RUN_NAME="${WANDB_RUN_NAME:-dwnt_e2former_fmm_cueq_${SLURM_JOB_ID:-local}}
 FMM_NUM_KAPPA="${FMM_NUM_KAPPA:-6}"
 FMM_KAPPA_MIN="${FMM_KAPPA_MIN:-0.8}"
 FMM_KAPPA_MAX="${FMM_KAPPA_MAX:-1.2}"
+LOADCHECK_PATH="${LOADCHECK_PATH:-}"
 
 echo "Running E2Former-FMM(cuEquivariance TP) on MD22 double_walled_nanotube"
 echo "Data: ${DATA_DIR}/${DATA_FILE}"
@@ -104,4 +106,5 @@ python -m torch.distributed.run \
   md22_molecule=double_walled_nanotube \
   md22_sample_size=-1 \
   md22_train_prop=0.95 \
-  md22_seed="${SEED}"
+  md22_seed="${SEED}" \
+  loadcheck_path="${LOADCHECK_PATH}"
