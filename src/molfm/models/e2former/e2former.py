@@ -810,6 +810,7 @@ class E2AttentionHybridShortLong(torch.nn.Module):
         fmm_num_directions: int = 25,
         fmm_kappa_chunk_size: int = 0,
         fmm_compute_dtype: str | None = "auto",
+        fmm_value_head_dim: int = 0,
         hybrid_long_scale_init: float = 1.0,
         **kwargs,
     ):
@@ -865,6 +866,7 @@ class E2AttentionHybridShortLong(torch.nn.Module):
             fmm_num_directions=fmm_num_directions,
             fmm_kappa_chunk_size=fmm_kappa_chunk_size,
             fmm_compute_dtype=fmm_compute_dtype,
+            fmm_value_head_dim=fmm_value_head_dim,
             **kwargs,
         )
         self.long_scale = nn.Parameter(
@@ -1064,6 +1066,7 @@ class TransBlock(torch.nn.Module):
         fmm_num_directions: int = 25,
         fmm_kappa_chunk_size: int = 0,
         fmm_compute_dtype: str | None = "auto",
+        fmm_value_head_dim: int = 0,
         hybrid_long_scale_init: float = 1.0,
     ):
         super().__init__()
@@ -1162,6 +1165,7 @@ class TransBlock(torch.nn.Module):
             fmm_num_directions=fmm_num_directions,
             fmm_kappa_chunk_size=fmm_kappa_chunk_size,
             fmm_compute_dtype=fmm_compute_dtype,
+            fmm_value_head_dim=fmm_value_head_dim,
             hybrid_long_scale_init=hybrid_long_scale_init,
         )
 
@@ -3067,6 +3071,7 @@ class E2former(torch.nn.Module):
         self.fmm_num_directions = int(kwargs.pop("fmm_num_directions", 25))
         self.fmm_kappa_chunk_size = int(kwargs.pop("fmm_kappa_chunk_size", 0))
         self.fmm_compute_dtype = kwargs.pop("fmm_compute_dtype", "auto")
+        self.fmm_value_head_dim = int(kwargs.pop("fmm_value_head_dim", 0))
         self.hybrid_long_scale_init = float(kwargs.pop("hybrid_long_scale_init", 1.0))
         if self.node_only_attention and self.decouple_EF:
             raise ValueError(
@@ -3169,6 +3174,7 @@ class E2former(torch.nn.Module):
                 fmm_num_directions=self.fmm_num_directions,
                 fmm_kappa_chunk_size=self.fmm_kappa_chunk_size,
                 fmm_compute_dtype=self.fmm_compute_dtype,
+                fmm_value_head_dim=self.fmm_value_head_dim,
                 hybrid_long_scale_init=self.hybrid_long_scale_init,
             )
             self.blocks.append(blk)
@@ -3201,6 +3207,7 @@ class E2former(torch.nn.Module):
                 fmm_num_directions=self.fmm_num_directions,
                 fmm_kappa_chunk_size=self.fmm_kappa_chunk_size,
                 fmm_compute_dtype=self.fmm_compute_dtype,
+                fmm_value_head_dim=self.fmm_value_head_dim,
                 hybrid_long_scale_init=self.hybrid_long_scale_init,
             )
 

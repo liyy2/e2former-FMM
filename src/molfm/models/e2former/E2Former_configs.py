@@ -142,6 +142,8 @@ class E2FormerBackboneConfigs:
     fmm_num_directions: int = 25
     fmm_kappa_chunk_size: int = 0
     fmm_compute_dtype: str = "auto"  # auto|fp32|bf16|fp16
+    # Optional per-head value bottleneck for node-only FMM (0 = disable).
+    fmm_value_head_dim: int = 0
     hybrid_long_scale_init: float = 1.0
     cluster_ckpt_path: str = ""
     with_cluster: bool = False

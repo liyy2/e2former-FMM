@@ -45,7 +45,9 @@ Notation / index conventions used in this file:
     max_nodes: maximum number of nodes in any graph (padding dimension)
     H:     number of attention heads (num_attn_heads)
     d:     per-head query/key dimension (attn_scalar_head)
-    Cv:    per-head value dimension (value_head_dim = scalar_dim / H)
+    Cv:    per-head value dimension used inside the FMM core. By default
+           Cv = scalar_dim / H, but this module can optionally bottleneck
+           values via `fmm_value_head_dim` for speed.
     C:     total feature channels (scalar_dim = H * Cv)
     ell:   degree index from the FMM spherical Bessel expansion (0..lmax)
     lambda: degree index from the input value irreps (0..lmax)
@@ -104,6 +106,9 @@ class E2AttentionNodeFMM(nn.Module):
         fmm_kappa_min: Minimum radial frequency.
         fmm_kappa_max: Maximum radial frequency. A tighter band improves
             finite-direction equivariance at unchanged runtime.
+        fmm_value_head_dim: Optional value bottleneck per head (Cv). If > 0 and
+            different from (scalar_dim / H), values are projected down before the
+            FMM core and projected back afterwards (bias-free, equivariant).
         (all other kwargs are accepted for interface compatibility but discarded)
     """
 
@@ -132,6 +137,7 @@ class E2AttentionNodeFMM(nn.Module):
         fmm_num_directions: int = 25,
         fmm_kappa_chunk_size: int = 0,
         fmm_compute_dtype: str | None = "auto",
+        fmm_value_head_dim: int = 0,
         **kwargs,
     ):
         super().__init__()
@@ -202,7 +208,26 @@ class E2AttentionNodeFMM(nn.Module):
         # using a degree-wise linear transform followed by per-degree inner products
         # and a final MLP. This collapses angular information into scalars suitable
         # for the attention dot product.
-        self.value_head_dim = self.scalar_dim // self.num_attn_heads  # Cv = C / H
+        # Default V head dim follows standard attention: Cv = C / H.
+        # Optionally shrink Cv via a bias-free linear bottleneck (equivariant).
+        value_head_dim_in = self.scalar_dim // self.num_attn_heads
+        value_head_dim_req = int(fmm_value_head_dim)
+        self.value_head_dim = value_head_dim_in if value_head_dim_req <= 0 else value_head_dim_req
+        self.v_proj: nn.Linear | None = None
+        self.out_proj: nn.Linear | None = None
+        if self.value_head_dim != value_head_dim_in:
+            # Note: bias would break equivariance for l>0 components (would introduce
+            # fixed tensors in coefficient space). Keep these strictly linear.
+            self.v_proj = nn.Linear(
+                self.scalar_dim,
+                self.num_attn_heads * self.value_head_dim,
+                bias=False,
+            )
+            self.out_proj = nn.Linear(
+                self.num_attn_heads * self.value_head_dim,
+                self.scalar_dim,
+                bias=False,
+            )
         self.q_proj = SO3_Linear2Scalar_e2former(
             self.scalar_dim,                              # C_in = scalar_dim
             self.num_attn_heads * self.attn_scalar_head,  # C_out = H * d
@@ -433,9 +458,9 @@ class E2AttentionNodeFMM(nn.Module):
             pack_info:     Opaque packing metadata consumed by _unpack_by_graph.
                            If the input `batch` is nondecreasing (common in this repo),
                            we use a fast scatter-based packing path and store
-                           (mode, batch, idx_in_graph). Otherwise we fall back to
-                           the original per-graph `nonzero` indexing and store
-                           (mode, node_indices).
+                           (mode, batch, idx_in_graph). Otherwise we use an
+                           argsort+scatter packing path (no Python per-graph loops)
+                           and store (mode, perm, batch_sorted, idx_in_graph_sorted).
         """
         num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
         counts = torch.bincount(batch, minlength=num_graphs)
@@ -469,16 +494,25 @@ class E2AttentionNodeFMM(nn.Module):
             return packed_pos, packed_irreps, packed_mask, pack_info
 
         # Fallback: general (unsorted) batch layouts.
-        node_indices: list[torch.Tensor] = []
-        for graph_id in range(num_graphs):
-            idx = torch.nonzero(batch == graph_id, as_tuple=False).squeeze(-1)
-            node_indices.append(idx)
-            if idx.numel() == 0:
-                continue
-            packed_pos[graph_id, : idx.numel()] = node_pos[idx]
-            packed_irreps[graph_id, : idx.numel()] = node_irreps[idx]
-            packed_mask[graph_id, : idx.numel()] = True
-        pack_info = ("indices", node_indices)
+        #
+        # Avoid a Python `for graph_id in range(num_graphs)` loop (which becomes
+        # expensive when there are many small graphs). We sort nodes by graph id,
+        # then scatter into the dense (B, max_nodes, ...) tensors.
+        perm = batch.argsort()
+        batch_s = batch[perm]
+        pos_s = node_pos[perm]
+        irreps_s = node_irreps[perm]
+
+        start = torch.zeros((num_graphs,), device=batch.device, dtype=torch.long)
+        if num_graphs > 1:
+            start[1:] = counts.cumsum(dim=0)[:-1]
+        idx_in_graph_s = torch.arange(batch_s.numel(), device=batch.device, dtype=torch.long)
+        idx_in_graph_s = idx_in_graph_s - start[batch_s]
+
+        packed_pos[batch_s, idx_in_graph_s] = pos_s
+        packed_irreps[batch_s, idx_in_graph_s] = irreps_s
+        packed_mask[batch_s, idx_in_graph_s] = True
+        pack_info = ("argsort_batch", perm, batch_s, idx_in_graph_s)
         return packed_pos, packed_irreps, packed_mask, pack_info
 
     @staticmethod
@@ -510,15 +544,15 @@ class E2AttentionNodeFMM(nn.Module):
                 )
             return packed_output[batch, idx_in_graph]
 
-        if mode == "indices":
-            _, node_indices = pack_info
-            out = packed_output.new_zeros(
-                (n_nodes, packed_output.shape[2], packed_output.shape[3])
-            )
-            for graph_id, idx in enumerate(node_indices):
-                if idx.numel() == 0:
-                    continue
-                out[idx] = packed_output[graph_id, : idx.numel()]
+        if mode == "argsort_batch":
+            _, perm, batch_s, idx_in_graph_s = pack_info
+            if int(perm.numel()) != int(n_nodes):
+                raise ValueError(
+                    f"pack_info perm length {int(perm.numel())} must match n_nodes={int(n_nodes)}"
+                )
+            out_sorted = packed_output[batch_s, idx_in_graph_s]
+            out = out_sorted.new_empty((n_nodes,) + out_sorted.shape[1:])
+            out[perm] = out_sorted
             return out
 
         raise ValueError(f"Unknown pack_info mode {mode!r}")
@@ -725,8 +759,9 @@ class E2AttentionNodeFMM(nn.Module):
         # Step 4: Prepare value irreps for FMM
         # =====================================================================
         # Allocate the final output tensor (same shape as input irreps).
+        value_dim_total = self.num_attn_heads * self.value_head_dim
         packed_out = packed_irreps.new_zeros(
-            (num_graphs, max_nodes, (self.lmax + 1) ** 2, self.scalar_dim)
+            (num_graphs, max_nodes, (self.lmax + 1) ** 2, value_dim_total)
         )
         num_irrep_components = self.num_irrep_components  # = (lmax+1)^2
 
@@ -735,12 +770,18 @@ class E2AttentionNodeFMM(nn.Module):
         # We split C into (H, Cv) and move the head axis:
         #   (B, max_nodes, Q, H, Cv) -> permute -> (B, max_nodes, H, Q, Cv)
         # This keeps all lambda-components together per head for the FMM.
-        v_all = packed_irreps.view(
+        if self.v_proj is None:
+            packed_v = packed_irreps
+        else:
+            # (B, N, Q, C) -> (B, N, Q, H*Cv_small)
+            packed_v = self.v_proj(packed_irreps)
+
+        v_all = packed_v.view(
             num_graphs,
             max_nodes,
             num_irrep_components,   # Q = (lmax+1)^2 lambda components
             self.num_attn_heads,    # H
-            self.value_head_dim,    # Cv
+            self.value_head_dim,    # Cv (possibly bottlenecked)
         ).permute(0, 1, 3, 2, 4).contiguous()  # (B, max_nodes, H, Q, Cv)
 
         # Flatten the (Q, Cv) dimensions into a single value dimension for the
@@ -880,7 +921,7 @@ class E2AttentionNodeFMM(nn.Module):
             # Rearrange from (B, N, H, m_out, Cv) to (B, N, m_out, H*Cv) = (B, N, m_out, C)
             # to match the input irreps layout.
             block = block.permute(0, 1, 3, 2, 4).contiguous()
-            block = block.reshape(num_graphs, max_nodes, m_out, self.scalar_dim)
+            block = block.reshape(num_graphs, max_nodes, m_out, value_dim_total)
 
             # Place into the correct slice of the packed output.
             out_start, out_end = self._l_slice(out_l)
@@ -895,6 +936,9 @@ class E2AttentionNodeFMM(nn.Module):
         for out_l in range(self.lmax + 1):
             out_start, out_end = self._l_slice(out_l)
             packed_out[:, :, out_start:out_end, :].div_(self.coupling_count[out_l])
+
+        if self.out_proj is not None:
+            packed_out = self.out_proj(packed_out)
 
         # =====================================================================
         # Step 9: Unpack back to flat node indexing and return

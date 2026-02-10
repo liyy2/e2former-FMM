@@ -70,6 +70,7 @@ FMM_KAPPA_MAX="${FMM_KAPPA_MAX:-1.2}"
 FMM_NUM_DIRECTIONS="${FMM_NUM_DIRECTIONS:-16}"
 FMM_COMPUTE_DTYPE="${FMM_COMPUTE_DTYPE:-bf16}" # auto|fp32|bf16|fp16
 FMM_KAPPA_CHUNK_SIZE="${FMM_KAPPA_CHUNK_SIZE:-0}"
+FMM_VALUE_HEAD_DIM="${FMM_VALUE_HEAD_DIM:-0}" # 0=disable; e.g. 8 or 16 to shrink V_dim
 
 LOADCHECK_PATH="${LOADCHECK_PATH:-}"
 
@@ -105,7 +106,7 @@ echo "Data: ${DATA_DIR}/${DATA_FILE}"
 echo "Save dir: ${SAVE_DIR}"
 echo "Serial schedule: ${SERIAL_ATTN_TYPE} (num_layers=${NUM_LAYERS})"
 echo "Local cutoff: r=${MAX_RADIUS} max_neighbors=${MAX_NEIGHBORS}"
-echo "FMM: nk=${FMM_NUM_KAPPA} kappa=[${FMM_KAPPA_MIN},${FMM_KAPPA_MAX}] dirs=${FMM_NUM_DIRECTIONS} dtype=${FMM_COMPUTE_DTYPE}"
+echo "FMM: nk=${FMM_NUM_KAPPA} kappa=[${FMM_KAPPA_MIN},${FMM_KAPPA_MAX}] dirs=${FMM_NUM_DIRECTIONS} dtype=${FMM_COMPUTE_DTYPE} v_head_dim=${FMM_VALUE_HEAD_DIM}"
 echo "DDP: nnodes=${NNODES} node_rank=${NODE_RANK} gpus_per_node=${GPUS_PER_NODE} world_size=${WORLD_SIZE}"
 echo "Batch: per_gpu=${PER_GPU_BATCH} grad_accum=${GRAD_ACCUM} train_batch_size(global)=${TRAIN_BATCH_SIZE}"
 
@@ -142,6 +143,7 @@ python -m torch.distributed.run \
   backbone_config.fmm_num_directions="${FMM_NUM_DIRECTIONS}" \
   backbone_config.fmm_compute_dtype="${FMM_COMPUTE_DTYPE}" \
   backbone_config.fmm_kappa_chunk_size="${FMM_KAPPA_CHUNK_SIZE}" \
+  backbone_config.fmm_value_head_dim="${FMM_VALUE_HEAD_DIM}" \
   max_lr="${MAX_LR}" \
   min_lr="${MIN_LR}" \
   warmup_num_steps="${WARMUP_STEPS}" \

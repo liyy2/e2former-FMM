@@ -52,6 +52,8 @@ fmm_kappa_max: 1.4
 fmm_num_directions: 25
 fmm_kappa_chunk_size: 0
 fmm_compute_dtype: "auto" # auto|fp32|bf16|fp16
+# Optional per-head V bottleneck for the long-range FMM branch (0 = disable).
+fmm_value_head_dim: 0
 hybrid_long_scale_init: 1.0
 edge_embedtype: "eqv2"
 attn_biastype: "share"

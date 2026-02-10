@@ -50,6 +50,8 @@ fmm_kappa_max: 1.4
 fmm_num_directions: 25
 fmm_kappa_chunk_size: 0
 fmm_compute_dtype: "auto" # auto|fp32|bf16|fp16
+# Optional per-head V bottleneck for FMM (0 = disable; e.g., 8 or 16 for speed).
+fmm_value_head_dim: 0
 edge_embedtype: "eqv2"
 attn_biastype: "share"
 ffn_type: "eqv2ffn"
