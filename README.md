@@ -15,30 +15,30 @@ node with linear-time node-wise operations.
 
 The core operator follows an equivariant attention form:
 
-\[
+$$
 \mathbf m_i^{(L)}=\sum_j \alpha_{ij}\,[\mathbf v_j^{(\lambda)}\otimes (f_\ell(r_{ij})\mathbf Y^{(\ell)}(\hat{\mathbf r}_{ij}))]^{(L)}.
-\]
+$$
 
 The implementation uses three key approximations/factorizations described in the TeX writeup:
 
 1. Linearized attention weights:
-\[
+$$
 \alpha_{ij}\approx \frac{\langle \varphi(\mathbf q_i),\varphi(\mathbf k_j)\rangle}{Z_i},\quad
 Z_i=\sum_n\langle \varphi(\mathbf q_i),\varphi(\mathbf k_n)\rangle.
-\]
+$$
 
-2. Spectral radial expansion for each angular order \(\ell\):
-\[
+2. Spectral radial expansion for each angular order $\ell$:
+$$
 f_\ell(r)\approx \sum_{q=1}^{Q} a_{\ell q}\,j_\ell(\kappa_q r).
-\]
+$$
 
 3. Plane-wave/spherical quadrature factorization:
-\[
+$$
 j_\ell(\kappa r)Y_\ell(\hat r)\ \leadsto\ \sum_s w_s\,Y_\ell(u_s)\,e^{i\kappa u_s\cdot r_i}\,e^{-i\kappa u_s\cdot r_j}.
-\]
+$$
 
-This yields a true node-wise form where all \(j\)-dependence is compressed into global moments
-\(\mathbf M_{q,s}\) and a global key sum, then each node \(i\) is evaluated without explicit edge loops.
+This yields a true node-wise form where all $j$-dependence is compressed into global moments
+$\mathbf M_{q,s}$ and a global key sum, then each node $i$ is evaluated without explicit edge loops.
 
 Why this is useful:
 
