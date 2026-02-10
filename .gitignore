@@ -7,3 +7,4 @@ wandb/
 swanlog/
 
 pretrain_config.yaml
+AGENTS.md
