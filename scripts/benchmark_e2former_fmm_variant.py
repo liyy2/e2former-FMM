@@ -116,6 +116,15 @@ def _parse_args() -> argparse.Namespace:
         choices=["auto", "fp32", "bf16", "fp16"],
         help="Optional low-precision compute dtype for the FMM core.",
     )
+    parser.add_argument(
+        "--fmm-value-head-dim",
+        type=int,
+        default=0,
+        help=(
+            "Optional per-head value bottleneck for fmm-node attention. "
+            "0 disables; e.g. 8 or 16 reduces V_dim inside FMM."
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
@@ -226,6 +235,7 @@ def main() -> None:
         fmm_num_directions=args.fmm_num_directions,
         fmm_kappa_chunk_size=args.fmm_kappa_chunk_size,
         fmm_compute_dtype=args.fmm_compute_dtype,
+        fmm_value_head_dim=args.fmm_value_head_dim,
         **common,
     ).to(device)
 
@@ -241,7 +251,9 @@ def main() -> None:
         f"device={device} B={args.B} num_nodes={nodes_per_graph} layers={args.layers} "
         f"max_neighbors={args.max_neighbors} radius={args.radius} pos_scale={args.pos_scale} "
         f"fmm_tp_backend={args.fmm_tp_backend} "
-        f"fmm_num_kappa={args.fmm_num_kappa} kappa=[{args.fmm_kappa_min},{args.fmm_kappa_max}]"
+        f"fmm_num_kappa={args.fmm_num_kappa} kappa=[{args.fmm_kappa_min},{args.fmm_kappa_max}] "
+        f"fmm_num_directions={args.fmm_num_directions} fmm_compute_dtype={args.fmm_compute_dtype} "
+        f"fmm_value_head_dim={args.fmm_value_head_dim}"
     )
     print(f"baseline(edge) forward: {t_baseline * 1e3:.3f} ms")
     print(f"fmm-node forward:       {t_fmm_node * 1e3:.3f} ms")
@@ -257,6 +269,7 @@ def main() -> None:
             fmm_num_directions=args.fmm_num_directions,
             fmm_kappa_chunk_size=args.fmm_kappa_chunk_size,
             fmm_compute_dtype=args.fmm_compute_dtype,
+            fmm_value_head_dim=args.fmm_value_head_dim,
             **common,
         ).to(device)
         t_hybrid = _time_forward(
@@ -289,6 +302,7 @@ def main() -> None:
             fmm_num_directions=args.fmm_num_directions,
             fmm_kappa_chunk_size=args.fmm_kappa_chunk_size,
             fmm_compute_dtype=args.fmm_compute_dtype,
+            fmm_value_head_dim=args.fmm_value_head_dim,
             **common,
         ).to(device)
         t_serial = _time_forward(
