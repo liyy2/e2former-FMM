@@ -59,6 +59,11 @@ LOCAL_LAYERS="${LOCAL_LAYERS:-6}"
 GLOBAL_LAYERS="${GLOBAL_LAYERS:-$((NUM_LAYERS - LOCAL_LAYERS))}"
 SERIAL_ATTN_TYPE="${SERIAL_ATTN_TYPE:-first-order${LOCAL_LAYERS}+fmm-node${GLOBAL_LAYERS}}"
 
+# Local cutoff (applies to first-order/edge attention blocks only).
+MAX_RADIUS="${MAX_RADIUS:-15.0}"
+PBC_MAX_RADIUS="${PBC_MAX_RADIUS:-${MAX_RADIUS}}"
+MAX_NEIGHBORS="${MAX_NEIGHBORS:-20}"
+
 FMM_NUM_KAPPA="${FMM_NUM_KAPPA:-6}"
 FMM_KAPPA_MIN="${FMM_KAPPA_MIN:-0.8}"
 FMM_KAPPA_MAX="${FMM_KAPPA_MAX:-1.2}"
@@ -99,6 +104,7 @@ echo "Running E2Former serial hybrid on MD22 double_walled_nanotube"
 echo "Data: ${DATA_DIR}/${DATA_FILE}"
 echo "Save dir: ${SAVE_DIR}"
 echo "Serial schedule: ${SERIAL_ATTN_TYPE} (num_layers=${NUM_LAYERS})"
+echo "Local cutoff: r=${MAX_RADIUS} max_neighbors=${MAX_NEIGHBORS}"
 echo "FMM: nk=${FMM_NUM_KAPPA} kappa=[${FMM_KAPPA_MIN},${FMM_KAPPA_MAX}] dirs=${FMM_NUM_DIRECTIONS} dtype=${FMM_COMPUTE_DTYPE}"
 echo "DDP: nnodes=${NNODES} node_rank=${NODE_RANK} gpus_per_node=${GPUS_PER_NODE} world_size=${WORLD_SIZE}"
 echo "Batch: per_gpu=${PER_GPU_BATCH} grad_accum=${GRAD_ACCUM} train_batch_size(global)=${TRAIN_BATCH_SIZE}"
@@ -125,6 +131,9 @@ python -m torch.distributed.run \
   backbone=e2former \
   backbone_config=e2former_hybrid \
   backbone_config.num_layers="${NUM_LAYERS}" \
+  backbone_config.max_radius="${MAX_RADIUS}" \
+  backbone_config.pbc_max_radius="${PBC_MAX_RADIUS}" \
+  backbone_config.max_neighbors="${MAX_NEIGHBORS}" \
   backbone_config.attn_type="${SERIAL_ATTN_TYPE}" \
   backbone_config.tp_type="QK_alpha+tp_cueq" \
   backbone_config.fmm_num_kappa="${FMM_NUM_KAPPA}" \
