@@ -74,6 +74,15 @@ FMM_VALUE_HEAD_DIM="${FMM_VALUE_HEAD_DIM:-0}" # 0=disable; e.g. 8 or 16 to shrin
 
 LOADCHECK_PATH="${LOADCHECK_PATH:-}"
 
+# Optional microbenchmark for the value bottleneck (runs before training).
+RUN_FMM_VBOTTLENECK_BENCH="${RUN_FMM_VBOTTLENECK_BENCH:-0}" # 0/1
+BENCH_VDIMS="${BENCH_VDIMS:-0 8 16}"
+BENCH_B="${BENCH_B:-2}"
+BENCH_NODES_PER_GRAPH="${BENCH_NODES_PER_GRAPH:-512}"
+BENCH_POS_SCALE="${BENCH_POS_SCALE:-1.0}"
+BENCH_WARMUP="${BENCH_WARMUP:-5}"
+BENCH_ITERS="${BENCH_ITERS:-20}"
+
 # Avoid collisions when multiple jobs share a node.
 MASTER_PORT="${MASTER_PORT:-$((20000 + (${SLURM_JOB_ID:-0} % 20000)))}"
 MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)}"
@@ -109,6 +118,41 @@ echo "Local cutoff: r=${MAX_RADIUS} max_neighbors=${MAX_NEIGHBORS}"
 echo "FMM: nk=${FMM_NUM_KAPPA} kappa=[${FMM_KAPPA_MIN},${FMM_KAPPA_MAX}] dirs=${FMM_NUM_DIRECTIONS} dtype=${FMM_COMPUTE_DTYPE} v_head_dim=${FMM_VALUE_HEAD_DIM}"
 echo "DDP: nnodes=${NNODES} node_rank=${NODE_RANK} gpus_per_node=${GPUS_PER_NODE} world_size=${WORLD_SIZE}"
 echo "Batch: per_gpu=${PER_GPU_BATCH} grad_accum=${GRAD_ACCUM} train_batch_size(global)=${TRAIN_BATCH_SIZE}"
+
+if [[ "${RUN_FMM_VBOTTLENECK_BENCH}" == "1" ]]; then
+  echo
+  echo "== serial speed compare (before vs after V bottleneck) =="
+  echo "Benchmark config: layers=${NUM_LAYERS} serial_local_layers=${LOCAL_LAYERS} B=${BENCH_B} nodes_per_graph=${BENCH_NODES_PER_GRAPH}"
+  echo "FMM: nk=${FMM_NUM_KAPPA} kappa=[${FMM_KAPPA_MIN},${FMM_KAPPA_MAX}] dirs=${FMM_NUM_DIRECTIONS} dtype=${FMM_COMPUTE_DTYPE}"
+  for _vd in ${BENCH_VDIMS}; do
+    echo
+    echo "## fmm_value_head_dim=${_vd}"
+    python scripts/benchmark_e2former_fmm_variant.py \
+      --device cuda \
+      --B "${BENCH_B}" \
+      --nodes-per-graph "${BENCH_NODES_PER_GRAPH}" \
+      --layers "${NUM_LAYERS}" \
+      --include-serial \
+      --serial-local-layers "${LOCAL_LAYERS}" \
+      --radius "${MAX_RADIUS}" \
+      --max-neighbors "${MAX_NEIGHBORS}" \
+      --pos-scale "${BENCH_POS_SCALE}" \
+      --number-of-basis 128 \
+      --heads 4 \
+      --attn-scalar-head 32 \
+      --fmm-tp-backend cueq \
+      --fmm-num-kappa "${FMM_NUM_KAPPA}" \
+      --fmm-kappa-min "${FMM_KAPPA_MIN}" \
+      --fmm-kappa-max "${FMM_KAPPA_MAX}" \
+      --fmm-num-directions "${FMM_NUM_DIRECTIONS}" \
+      --fmm-kappa-chunk-size "${FMM_KAPPA_CHUNK_SIZE}" \
+      --fmm-compute-dtype "${FMM_COMPUTE_DTYPE}" \
+      --fmm-value-head-dim "${_vd}" \
+      --warmup "${BENCH_WARMUP}" \
+      --iters "${BENCH_ITERS}"
+  done
+  echo
+fi
 
 python -m torch.distributed.run \
   --nnodes="${NNODES}" \
