@@ -7,6 +7,45 @@ This repo contains the E2Former-FMM training pipeline, datasets utilities, and a
 training entrypoint. The default training shell script is `scripts/train_e2former.sh`,
 which launches the Python entrypoint in `src/molfm/tasks/train_molfm.py`.
 
+The FMM variants are designed to capture **global context** efficiently: instead of building
+explicit pairwise edges for all node pairs, they aggregate global moments and evaluate each
+node with linear-time node-wise operations.
+
+## FMM Method Summary (aligned with `FMM/fmm.tex`)
+
+The core operator follows an equivariant attention form:
+
+\[
+\mathbf m_i^{(L)}=\sum_j \alpha_{ij}\,[\mathbf v_j^{(\lambda)}\otimes (f_\ell(r_{ij})\mathbf Y^{(\ell)}(\hat{\mathbf r}_{ij}))]^{(L)}.
+\]
+
+The implementation uses three key approximations/factorizations described in the TeX writeup:
+
+1. Linearized attention weights:
+\[
+\alpha_{ij}\approx \frac{\langle \varphi(\mathbf q_i),\varphi(\mathbf k_j)\rangle}{Z_i},\quad
+Z_i=\sum_n\langle \varphi(\mathbf q_i),\varphi(\mathbf k_n)\rangle.
+\]
+
+2. Spectral radial expansion for each angular order \(\ell\):
+\[
+f_\ell(r)\approx \sum_{q=1}^{Q} a_{\ell q}\,j_\ell(\kappa_q r).
+\]
+
+3. Plane-wave/spherical quadrature factorization:
+\[
+j_\ell(\kappa r)Y_\ell(\hat r)\ \leadsto\ \sum_s w_s\,Y_\ell(u_s)\,e^{i\kappa u_s\cdot r_i}\,e^{-i\kappa u_s\cdot r_j}.
+\]
+
+This yields a true node-wise form where all \(j\)-dependence is compressed into global moments
+\(\mathbf M_{q,s}\) and a global key sum, then each node \(i\) is evaluated without explicit edge loops.
+
+Why this is useful:
+
+- Captures long-range/global interactions in a single layer (not limited by local neighbor cutoff).
+- Keeps equivariant angular structure through spherical harmonics and tensor coupling.
+- Reduces global interaction cost from quadratic pairwise aggregation to linear-time moment aggregation/evaluation (for fixed spectral and quadrature ranks).
+
 ## Project Layout
 
 - `src/molfm/models`: backbone and head definitions for E2Former and related models
@@ -48,7 +87,8 @@ Node-only FMM variant:
 
 - Use `config_file/backbone_config/e2former_fmm.yaml` as the Hydra backbone config.
 - This variant enables `attn_type: fmm-node` and `tp_type: fmm-node+tp_cueq`, which runs
-  node-based FMM attention without edge-neighbor attention construction and uses
+  node-based FMM attention without edge-neighbor attention construction, captures global
+  context through moment aggregation, and uses
   cuEquivariance tensor-product kernels when available.
 - The default FMM radial band is configured by `fmm_num_kappa`, `fmm_kappa_min`,
   and `fmm_kappa_max` in the same config; the shipped defaults prioritize lower
