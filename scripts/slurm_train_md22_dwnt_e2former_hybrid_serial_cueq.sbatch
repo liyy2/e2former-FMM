@@ -38,7 +38,23 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
 export SWANLAB_ENABLE=0
 export NCCL_ASYNC_ERROR_HANDLING=1
 
-python -c "import cuequivariance_torch as cueq; print('cuequivariance_torch', getattr(cueq, '__version__', 'unknown'))"
+CUEQ_IMPORT_TIMEOUT="${CUEQ_IMPORT_TIMEOUT:-45}"
+CUEQ_IMPORT_RETRIES="${CUEQ_IMPORT_RETRIES:-3}"
+cueq_import_ok=0
+for ((i=1; i<=CUEQ_IMPORT_RETRIES; i++)); do
+  if timeout "${CUEQ_IMPORT_TIMEOUT}" \
+      python -c "import cuequivariance_torch as cueq; print('cuequivariance_torch', getattr(cueq, '__version__', 'unknown'))"; then
+    cueq_import_ok=1
+    break
+  fi
+  echo "[warn] cuequivariance_torch import attempt ${i}/${CUEQ_IMPORT_RETRIES} failed or timed out (${CUEQ_IMPORT_TIMEOUT}s)."
+  sleep 2
+done
+if [[ "${cueq_import_ok}" != "1" ]]; then
+  echo "[error] cuequivariance_torch import failed after ${CUEQ_IMPORT_RETRIES} attempts."
+  echo "        If this persists, set tp backend to e3nn or increase CUEQ_IMPORT_TIMEOUT."
+  exit 1
+fi
 python -c "from molfm.models.e2former.fmm_utils import _cueq_ops_available; print('cueq_ops_available', _cueq_ops_available())"
 
 DATA_DIR="${DATA_DIR:-${REPO_ROOT}/outputs/md22_full_lmdb/lmdb}"
@@ -71,6 +87,10 @@ FMM_NUM_DIRECTIONS="${FMM_NUM_DIRECTIONS:-16}"
 FMM_COMPUTE_DTYPE="${FMM_COMPUTE_DTYPE:-bf16}" # auto|fp32|bf16|fp16
 FMM_KAPPA_CHUNK_SIZE="${FMM_KAPPA_CHUNK_SIZE:-0}"
 FMM_VALUE_HEAD_DIM="${FMM_VALUE_HEAD_DIM:-0}" # 0=disable; e.g. 8 or 16 to shrink V_dim
+FMM_LEARNABLE_RADIAL_COEFFS="${FMM_LEARNABLE_RADIAL_COEFFS:-true}"
+FMM_RADIAL_COEFFS_MODE="${FMM_RADIAL_COEFFS_MODE:-per_l_head}" # per_l_head|per_l_shared|head|shared
+FMM_RADIAL_INIT_SCALE="${FMM_RADIAL_INIT_SCALE:-0.05}"
+FMM_RADIAL_LOW_KAPPA_BIAS="${FMM_RADIAL_LOW_KAPPA_BIAS:-2.0}"
 
 LOADCHECK_PATH="${LOADCHECK_PATH:-}"
 
@@ -116,6 +136,7 @@ echo "Save dir: ${SAVE_DIR}"
 echo "Serial schedule: ${SERIAL_ATTN_TYPE} (num_layers=${NUM_LAYERS})"
 echo "Local cutoff: r=${MAX_RADIUS} max_neighbors=${MAX_NEIGHBORS}"
 echo "FMM: nk=${FMM_NUM_KAPPA} kappa=[${FMM_KAPPA_MIN},${FMM_KAPPA_MAX}] dirs=${FMM_NUM_DIRECTIONS} dtype=${FMM_COMPUTE_DTYPE} v_head_dim=${FMM_VALUE_HEAD_DIM}"
+echo "FMM radial: learnable=${FMM_LEARNABLE_RADIAL_COEFFS} mode=${FMM_RADIAL_COEFFS_MODE} init_scale=${FMM_RADIAL_INIT_SCALE} low_kappa_bias=${FMM_RADIAL_LOW_KAPPA_BIAS}"
 echo "DDP: nnodes=${NNODES} node_rank=${NODE_RANK} gpus_per_node=${GPUS_PER_NODE} world_size=${WORLD_SIZE}"
 echo "Batch: per_gpu=${PER_GPU_BATCH} grad_accum=${GRAD_ACCUM} train_batch_size(global)=${TRAIN_BATCH_SIZE}"
 
@@ -188,6 +209,10 @@ python -m torch.distributed.run \
   backbone_config.fmm_compute_dtype="${FMM_COMPUTE_DTYPE}" \
   backbone_config.fmm_kappa_chunk_size="${FMM_KAPPA_CHUNK_SIZE}" \
   backbone_config.fmm_value_head_dim="${FMM_VALUE_HEAD_DIM}" \
+  backbone_config.fmm_learnable_radial_coeffs="${FMM_LEARNABLE_RADIAL_COEFFS}" \
+  backbone_config.fmm_radial_coeffs_mode="${FMM_RADIAL_COEFFS_MODE}" \
+  backbone_config.fmm_radial_init_scale="${FMM_RADIAL_INIT_SCALE}" \
+  backbone_config.fmm_radial_low_kappa_bias="${FMM_RADIAL_LOW_KAPPA_BIAS}" \
   max_lr="${MAX_LR}" \
   min_lr="${MIN_LR}" \
   warmup_num_steps="${WARMUP_STEPS}" \

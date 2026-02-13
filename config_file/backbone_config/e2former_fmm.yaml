@@ -52,6 +52,14 @@ fmm_kappa_chunk_size: 0
 fmm_compute_dtype: "auto" # auto|fp32|bf16|fp16
 # Optional per-head V bottleneck for FMM (0 = disable; e.g., 8 or 16 for speed).
 fmm_value_head_dim: 0
+# Learnable spectral radial-mixture coefficients for global FMM.
+fmm_learnable_radial_coeffs: true
+# per_l_head | per_l_shared | head | shared
+fmm_radial_coeffs_mode: "per_l_head"
+# Small init scale; larger values make long-range branch stronger at step 0.
+fmm_radial_init_scale: 0.05
+# >0 biases initialization toward lower kappa components.
+fmm_radial_low_kappa_bias: 2.0
 edge_embedtype: "eqv2"
 attn_biastype: "share"
 ffn_type: "eqv2ffn"

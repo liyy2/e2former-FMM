@@ -3,12 +3,17 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: codex_monitor.sh [--interval <seconds>] [--state-dir <dir>] [--once]
+Usage: codex_monitor.sh [--interval <seconds>] [--work-dir <dir>] [--once]
                         [--repo-root <dir>] [--master-prompt <file>]
 
 Continuously delegates experiment monitoring/triage to Codex.
 Codex can inspect jobs, stop unhealthy runs, patch bugs, and relaunch.
 Exits when max calls is exceeded (or after one call with --once).
+
+Work directory contents (default: <repo_root>/outputs/codex_monitor):
+  - memory.md: append-only monitor memory (used for prompting and audit)
+  - last_report.json: last model JSON response
+  - slack/: cached Slack IDs to avoid feedback loops
 
 Environment:
   CODEX_CMD        Codex CLI binary (default: codex)
@@ -16,11 +21,13 @@ Environment:
   MAX_CALLS        Max Codex calls before exit (default: 400)
   JOB_NAME_REGEX   Regex for target job names (default: dwnt_e2former|md22|e2former_fmm|hybrid)
   SUBMIT_SCRIPT    Default relaunch script (default: scripts/submit_md22_dwnt_jobs.sh)
-  MASTER_PROMPT    Path to master_prompt.md (default: <script_dir>/master_prompt.md)
+  MASTER_PROMPT    Path to master_prompt.md (default: <script_dir>/master_prompt.md; CLI --master-prompt overrides)
   SLACK_BOT_TOKEN  Slack bot token (recommended; enables DM steering + status updates)
   SLACK_CHANNEL    Slack channel ID to post/read (DM channel ID recommended)
   SLACK_USER_ID    If SLACK_CHANNEL is unset, DM this Slack user and cache the DM channel ID
-  WANDB_API_KEY    Weights & Biases API key for experiment tracking
+
+Notes:
+  --state-dir is a deprecated alias for --work-dir.
 USAGE
 }
 
@@ -29,16 +36,17 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-INTERVAL="1200"
-ONCE="0"
-STATE_DIR=""
+INTERVAL="${INTERVAL:-1200}"
+ONCE="${ONCE:-0}"
+STATE_DIR="${STATE_DIR:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="${SCRIPT_DIR}"
-MASTER_PROMPT=""
+REPO_ROOT="${REPO_ROOT:-$SCRIPT_DIR}"
+MASTER_PROMPT="${MASTER_PROMPT:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --interval) INTERVAL="${2:-}"; shift 2 ;;
+    --work-dir) STATE_DIR="${2:-}"; shift 2 ;;
     --state-dir) STATE_DIR="${2:-}"; shift 2 ;;
     --repo-root) REPO_ROOT="${2:-}"; shift 2 ;;
     --master-prompt) MASTER_PROMPT="${2:-}"; shift 2 ;;
@@ -58,21 +66,17 @@ fi
 
 mkdir -p "$STATE_DIR"
 
-STATE="$STATE_DIR/state.json"
-REPORT="$STATE_DIR/report.json"
+MEMORY_FILE="$STATE_DIR/memory.md"
+LAST_REPORT="$STATE_DIR/last_report.json"
 
 CODEX_CMD="${CODEX_CMD:-codex}"
 CODEX_ARGS="${CODEX_ARGS:---dangerously-bypass-approvals-and-sandbox}"
 MAX_CALLS="${MAX_CALLS:-400}"
 JOB_NAME_REGEX="${JOB_NAME_REGEX:-dwnt_e2former|md22|e2former_fmm|hybrid}"
 SUBMIT_SCRIPT="${SUBMIT_SCRIPT:-scripts/submit_md22_dwnt_jobs.sh}"
-SLACK_WEBHOOK="${SLACK_WEBHOOK:-}"
 SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
 SLACK_CHANNEL="${SLACK_CHANNEL:-}"
 SLACK_USER_ID="${SLACK_USER_ID:-}"
-
-# Weights & Biases API key for experiment tracking:
-# set `WANDB_API_KEY` in your environment or run `wandb login` (do not hardcode keys here).
 
 # Master prompt file (experiment-specific goals)
 if [[ -z "$MASTER_PROMPT" ]]; then
@@ -82,26 +86,38 @@ fi
 TMP_DIR="$(mktemp -d /tmp/codexmon.XXXXXX)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-# Initialize state file if missing
-init_state() {
-  [[ -f "$STATE" ]] && return
-  cat > "$STATE" <<'JSON'
-{"last_summary":"","last_recommendation":"","last_prompt_ts":0,"call_count":0}
-JSON
+# Monitor memory: append-only log used for prompting and audit.
+memory_cycle_count() {
+  python3 - "$MEMORY_FILE" <<'PY'
+import re, sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+if not p.exists():
+    print(0)
+    raise SystemExit(0)
+
+text = p.read_text(encoding="utf-8", errors="ignore")
+print(len(re.findall(r"^### Cycle\\s+\\d+\\b", text, flags=re.M)))
+PY
 }
 
-read_state() {
-  python3 -c "import json; print(json.load(open('$STATE')).get('$1', ''))"
-}
+memory_tail() {
+  local max_chars="${1:-8000}"
+  python3 - "$MEMORY_FILE" "$max_chars" <<'PY'
+import sys
+from pathlib import Path
 
-write_state() {
-  python3 - "$STATE" "$1" "$2" "$3" "$4" <<'PY'
-import json, sys
-f, summary, recommendation, ts, calls = sys.argv[1:]
-s = json.load(open(f))
-s.update({"last_summary": summary, "last_recommendation": recommendation,
-          "last_prompt_ts": int(ts), "call_count": int(calls)})
-json.dump(s, open(f, "w"))
+p = Path(sys.argv[1])
+max_chars = int(sys.argv[2])
+if not p.exists():
+    print("")
+    raise SystemExit(0)
+
+text = p.read_text(encoding="utf-8", errors="ignore")
+if len(text) > max_chars:
+    text = text[-max_chars:]
+print(text)
 PY
 }
 
@@ -216,9 +232,15 @@ At each cycle:
 4) If no target jobs are running, launch new runs using the default submit scripts.
 5) Keep changes minimal and practical; prioritize concrete progress over long explanations.
 6) Treat the "User Feedback" section as high-priority steering instructions from the user.
+7) You must maintain monitor memory yourself by appending one entry per cycle to the provided memory file.
 
 Return exactly one JSON object on one line at the end:
-{"summary":"...","recommendation":"..."}
+{"summary":"...","recommendation":"...","patch_report":"..."}
+
+`patch_report` must describe the key code/config/script patches you actually applied in THIS cycle (not suggestions).
+- Slack-ready bullets; include file paths and what changed.
+- If you applied no patches this cycle, set "patch_report" to an empty string.
+- Ensure the memory entry you wrote is consistent with this JSON.
 EOF
 }
 
@@ -231,7 +253,7 @@ load_master_prompt() {
 }
 
 build_prompt() {
-  local prior_summary="$1" prior_recommendation="$2" call_count="$3"
+  local cycle_num="$1"
 
   local master_content
   master_content="$(load_master_prompt)"
@@ -245,12 +267,17 @@ build_prompt() {
   status_snapshot="$(job_snapshot)"
   printf '%s' "$status_snapshot" > "$TMP_DIR/status.txt"
 
-  cat > "$TMP_DIR/prompt.txt" <<EOF
+  local memory_context=""
+  memory_context="$(memory_tail 12000)"
+
+  cat > "$TMP_DIR/prompt.txt" <<__CODEXMON_EOF__
 $master_content
 
 Repository: $REPO_ROOT
 Target job regex: $JOB_NAME_REGEX
 Default submit script: $SUBMIT_SCRIPT
+Monitor memory file: $MEMORY_FILE
+Cycle number to write: $cycle_num
 
 ${status_snapshot:+## Current Status (local snapshot)
 $status_snapshot
@@ -260,20 +287,34 @@ $status_snapshot
 ${feedback:+## User Feedback
 $feedback
 
+}
+
+${memory_context:+## Memory (tail)
+$memory_context
+
 }---
 
 Return exactly one line of JSON:
-{"summary":"...","recommendation":"what to do next or try in next run"}
+{"summary":"...","recommendation":"what to do next or try in next run","patch_report":"slack-ready key patches applied in this cycle (or empty string)"}
 
-Prior summary: $prior_summary
-Prior recommendation: $prior_recommendation
-Call count: $call_count / $MAX_CALLS
-EOF
+Rules for patch_report:
+- Only include patches you actually applied this cycle (code/config/scripts).
+- Each bullet must start with a tag like [bugfix], [config], [perf], [logging], [infra].
+- Include file paths and what changed (not just why).
+- Keep it short: max ~8 bullets / ~1200 chars.
+
+Memory file rules (you must do this yourself in this cycle):
+- Append exactly one new block to "$MEMORY_FILE".
+- Start block with: "### Cycle $cycle_num (<ISO-8601 timestamp>)".
+- Include: summary, recommendation/next, and patch_report.
+- Do not rewrite or delete previous memory entries.
+
+Cycle: $cycle_num / $MAX_CALLS
+__CODEXMON_EOF__
 }
 
 job_snapshot() {
   local user="${USER:-}"
-  local header="JOBID NAME ST TIME NODES NODELIST(REASON)"
   local sq
   sq="$(squeue -u "$user" -o '%.18i %.25j %.2t %.10M %.6D %R' 2>/dev/null || true)"
   if [[ -z "$sq" ]]; then
@@ -336,6 +377,44 @@ PY
   done <<< "$jobids"
 }
 
+repo_patch_fingerprint() {
+  if ! command -v git >/dev/null 2>&1; then
+    echo ""
+    return 0
+  fi
+  (
+    git -C "$REPO_ROOT" status --porcelain=v1 -uall 2>/dev/null || true
+    git -C "$REPO_ROOT" diff --no-ext-diff HEAD 2>/dev/null || true
+  ) | python3 -c 'import hashlib,sys; print(hashlib.sha1(sys.stdin.buffer.read()).hexdigest())' 2>/dev/null || true
+}
+
+repo_patch_overview() {
+  if ! command -v git >/dev/null 2>&1; then
+    echo "(git unavailable)"
+    return 0
+  fi
+
+  local status_lines status_head status_count diff_shortstat
+  status_lines="$(git -C "$REPO_ROOT" status --porcelain=v1 -uall 2>/dev/null || true)"
+  status_count="$(echo "$status_lines" | wc -l | tr -d ' ' || true)"
+  status_head="$(echo "$status_lines" | head -n 60 || true)"
+  diff_shortstat="$(git -C "$REPO_ROOT" diff --shortstat HEAD 2>/dev/null | tr -s ' ' || true)"
+
+  if [[ -z "$status_lines" ]]; then
+    echo "(clean repo; no changes vs HEAD)"
+    return 0
+  fi
+
+  echo "git status --porcelain (top 60):"
+  echo "$status_head"
+  if [[ -n "$status_count" && "$status_count" -gt 60 ]]; then
+    echo "... (truncated; $status_count lines)"
+  fi
+  echo
+  echo "git diff --shortstat (vs HEAD):"
+  echo "${diff_shortstat:-<empty>}"
+}
+
 run_codex() {
   if ! command -v "$CODEX_CMD" >/dev/null 2>&1; then
     echo "Codex not found: $CODEX_CMD" >&2
@@ -376,12 +455,12 @@ for candidate in reversed(candidates):
     except Exception:
         pass
 
-print('{"summary":"(no valid JSON)","recommendation":""}')
+print('{"summary":"(no valid JSON)","recommendation":"","patch_report":""}')
 PY
 }
 
 get_json_field() {
-  python3 -c "import json; print(json.loads(open('$REPORT').readline()).get('$1',''))"
+  python3 -c "import json; print(json.loads(open('$LAST_REPORT').readline()).get('$1',''))"
 }
 
 send_slack() {
@@ -495,16 +574,13 @@ PY
 # ─────────────────────────────────────────────────────────────────
 # MAIN LOOP
 # ─────────────────────────────────────────────────────────────────
-init_state
+call_count="$(memory_cycle_count)"
 
 while true; do
   ensure_slack_channel
   slack_bot_identity
 
-  last_summary="$(read_state last_summary)"
-  last_recommendation="$(read_state last_recommendation)"
-  last_prompt_ts="$(read_state last_prompt_ts)"
-  call_count="$(read_state call_count)"
+  cycle_num="$((call_count + 1))"
 
   # Bail if max calls exceeded
   if (( call_count >= MAX_CALLS )); then
@@ -513,10 +589,8 @@ while true; do
     exit 0
   fi
 
-  now_ts="$(date +%s)"
-
   # Build prompt and call Codex
-  build_prompt "$last_summary" "$last_recommendation" "$call_count"
+  build_prompt "$cycle_num"
   
   # Emit a concise status snapshot to Slack before running Codex.
   if [[ -n "$SLACK_BOT_TOKEN" && -n "$SLACK_CHANNEL" ]]; then
@@ -524,32 +598,44 @@ while true; do
     feedback_preview="$(cat "$TMP_DIR/feedback.txt" 2>/dev/null || true)"
     slack_msg=""
     printf -v slack_msg "📡 [Monitor #%s] Status snapshot\n%s\n\nNew steering (if any):\n%s" \
-      "$((call_count + 1))" \
+      "$cycle_num" \
       "${status:-<empty>}" \
       "${feedback_preview:-<none>}"
     send_slack "$slack_msg"
   fi
   
+  pre_patch_fp="$(repo_patch_fingerprint)"
   run_codex
-  parse_json "$TMP_DIR/last_message.txt" > "$REPORT"
-  call_count=$(( call_count + 1 ))
+  post_patch_fp="$(repo_patch_fingerprint)"
+  parse_json "$TMP_DIR/last_message.txt" > "$LAST_REPORT"
+  call_count="$cycle_num"
 
   # Extract response fields
   summary="$(get_json_field summary)"
   recommendation="$(get_json_field recommendation)"
+  patch_report="$(get_json_field patch_report)"
 
-  # Always log recommendation to a separate file
-  if [[ -n "$recommendation" ]]; then
-    echo "[$(date)] $recommendation" >> "$STATE_DIR/recommendations.log"
+  patched="0"
+  repo_overview=""
+  if [[ -n "$pre_patch_fp" && -n "$post_patch_fp" && "$pre_patch_fp" != "$post_patch_fp" ]]; then
+    patched="1"
+    repo_overview="$(repo_patch_overview)"
+  fi
+
+  # Send Slack notification (patch delta)
+  if [[ "$patched" == "1" && -n "$SLACK_BOT_TOKEN" && -n "$SLACK_CHANNEL" ]]; then
+    patch_msg=""
+    printf -v patch_msg "🧩 [Monitor #%s] Patch report\n%s\n\nRepo changes:\n%s" \
+      "$cycle_num" \
+      "${patch_report:-<no patch_report provided by model>}" \
+      "${repo_overview:-<empty>}"
+    send_slack "$patch_msg"
   fi
 
   # Send Slack notification (Codex decision)
   slack_msg=""
-  printf -v slack_msg "[Monitor #%s] %s\nNext: %s" "$call_count" "$summary" "$recommendation"
+  printf -v slack_msg "[Monitor #%s] %s\nNext: %s" "$cycle_num" "$summary" "$recommendation"
   send_slack "$slack_msg"
-
-  # Update state
-  write_state "$summary" "$recommendation" "$now_ts" "$call_count"
 
   # Single iteration mode
   [[ "$ONCE" == "1" ]] && exit 0

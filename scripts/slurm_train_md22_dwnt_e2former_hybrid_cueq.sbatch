@@ -24,7 +24,23 @@ export DS_ACCELERATOR=cpu
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
 export SWANLAB_ENABLE=0
 
-python -c "import cuequivariance_torch as cueq; print('cuequivariance_torch', getattr(cueq, '__version__', 'unknown'))"
+CUEQ_IMPORT_TIMEOUT="${CUEQ_IMPORT_TIMEOUT:-45}"
+CUEQ_IMPORT_RETRIES="${CUEQ_IMPORT_RETRIES:-3}"
+cueq_import_ok=0
+for ((i=1; i<=CUEQ_IMPORT_RETRIES; i++)); do
+  if timeout "${CUEQ_IMPORT_TIMEOUT}" \
+      python -c "import cuequivariance_torch as cueq; print('cuequivariance_torch', getattr(cueq, '__version__', 'unknown'))"; then
+    cueq_import_ok=1
+    break
+  fi
+  echo "[warn] cuequivariance_torch import attempt ${i}/${CUEQ_IMPORT_RETRIES} failed or timed out (${CUEQ_IMPORT_TIMEOUT}s)."
+  sleep 2
+done
+if [[ "${cueq_import_ok}" != "1" ]]; then
+  echo "[error] cuequivariance_torch import failed after ${CUEQ_IMPORT_RETRIES} attempts."
+  echo "        If this persists, set tp backend to e3nn or increase CUEQ_IMPORT_TIMEOUT."
+  exit 1
+fi
 python -c "import loguru, deepspeed; print('deps_ok', True)"
 python -c "from molfm.models.e2former.fmm_utils import _cueq_ops_available; print('cueq_ops_available', _cueq_ops_available())"
 

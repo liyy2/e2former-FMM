@@ -1244,6 +1244,8 @@ class AlphaFRYSphericalFMMMultiL(nn.Module):
         feature_map: str = "elu",
         normalization: str = "integral",
         eps: float = 1e-8,
+        a_per_l: bool = False,
+        learnable_a: bool = False,
     ) -> None:
         super().__init__()
         if len(l_values) == 0:
@@ -1258,10 +1260,23 @@ class AlphaFRYSphericalFMMMultiL(nn.Module):
 
         if kappa.ndim != 1:
             raise ValueError(f"kappa must be 1D of shape (Q,), got {tuple(kappa.shape)}")
-        if a.ndim not in (1, 2, 3):
-            raise ValueError(
-                f"a must have shape (Q,), (H,Q), or (H,C,Q), got {tuple(a.shape)}"
-            )
+        self.a_per_l = bool(a_per_l)
+        if self.a_per_l:
+            if a.ndim not in (2, 3, 4):
+                raise ValueError(
+                    "When a_per_l=True, a must have shape (L,Q), (L,H,Q), or (L,H,C,Q), "
+                    f"got {tuple(a.shape)}"
+                )
+            if a.shape[0] != len(self.l_values):
+                raise ValueError(
+                    f"When a_per_l=True, a.shape[0] must equal number of l values={len(self.l_values)}, "
+                    f"got {a.shape[0]}"
+                )
+        else:
+            if a.ndim not in (1, 2, 3):
+                raise ValueError(
+                    f"a must have shape (Q,), (H,Q), or (H,C,Q), got {tuple(a.shape)}"
+                )
         if a.shape[-1] != kappa.shape[0]:
             raise ValueError(
                 f"a.shape[-1] must equal Q={kappa.shape[0]}, got a.shape={tuple(a.shape)}"
@@ -1300,9 +1315,13 @@ class AlphaFRYSphericalFMMMultiL(nn.Module):
         self.center_positions = bool(center_positions)
         self.sh_backend = sh_backend
         self.last_kappa_chunk: Optional[int] = None
+        self.learnable_a = bool(learnable_a)
 
         self.register_buffer("kappa", kappa.detach().clone())
-        self.register_buffer("a", a.detach().clone())
+        if self.learnable_a:
+            self.register_parameter("a", nn.Parameter(a.detach().clone()))
+        else:
+            self.register_buffer("a", a.detach().clone())
 
         if sphere not in ("lebedev", "fibonacci", "e3nn_s2grid", "gauss_legendre"):
             raise ValueError(
@@ -1450,14 +1469,42 @@ class AlphaFRYSphericalFMMMultiL(nn.Module):
         dot = torch.einsum("blc,sc->bls", pos_f, dirs)
         C = v_flat.shape[-1]
         kappa = self.kappa.to(device=pos.device, dtype=compute_dtype)
-        a_coeff, a_mode = prepare_radial_coeffs(
-            self.a,
-            num_kappa=int(kappa.shape[0]),
-            num_heads=H,
-            value_dim=C,
-            device=pos.device,
-            dtype=compute_dtype,
-        )
+        a_coeff_list: list[torch.Tensor] = []
+        if self.a_per_l:
+            if int(self.a.shape[0]) != len(self.l_values):
+                raise RuntimeError(
+                    f"a_per_l expects first dim L={len(self.l_values)}, got {int(self.a.shape[0])}"
+                )
+            a_mode: Optional[str] = None
+            for l_idx in range(len(self.l_values)):
+                a_coeff_l, a_mode_l = prepare_radial_coeffs(
+                    self.a[l_idx],
+                    num_kappa=int(kappa.shape[0]),
+                    num_heads=H,
+                    value_dim=C,
+                    device=pos.device,
+                    dtype=compute_dtype,
+                )
+                if a_mode is None:
+                    a_mode = a_mode_l
+                elif a_mode_l != a_mode:
+                    raise RuntimeError(
+                        "All per-l radial coefficients must share the same broadcast mode, "
+                        f"got {a_mode!r} and {a_mode_l!r}."
+                    )
+                a_coeff_list.append(a_coeff_l)
+            if a_mode is None:
+                raise RuntimeError("Failed to infer radial coefficient mode for per-l coefficients.")
+        else:
+            a_coeff_shared, a_mode = prepare_radial_coeffs(
+                self.a,
+                num_kappa=int(kappa.shape[0]),
+                num_heads=H,
+                value_dim=C,
+                device=pos.device,
+                dtype=compute_dtype,
+            )
+            a_coeff_list = [a_coeff_shared] * len(self.l_values)
         v_compute = v_flat.to(dtype=compute_dtype)
 
         restore_tf32 = False
@@ -1509,10 +1556,10 @@ class AlphaFRYSphericalFMMMultiL(nn.Module):
                         phi_q_c = phi_q.to(dtype=complex_dtype)
                         v_c = v_compute.to(dtype=complex_dtype)
                         gamma_list = []
-                        for l in self.l_values:
+                        for idx, l in enumerate(self.l_values):
                             c_l = complex((1j) ** (-l))
                             c_l_t = torch.tensor(c_l, device=pos.device, dtype=complex_dtype)
-                            gamma_list.append(a_coeff.to(dtype=complex_dtype) * c_l_t)
+                            gamma_list.append(a_coeff_list[idx].to(dtype=complex_dtype) * c_l_t)
 
                         for q_start in range(0, int(kappa.shape[0]), q_chunk):
                             q_end = min(q_start + q_chunk, int(kappa.shape[0]))
@@ -1595,42 +1642,80 @@ class AlphaFRYSphericalFMMMultiL(nn.Module):
                             moment_imag = -torch.einsum("blst,blhd,blhc->bsthdc", sin_p, phi_k, v_compute)
                             b_real = torch.einsum("blhd,bsthdc->blsthc", phi_q, moment_real)
                             b_imag = torch.einsum("blhd,bsthdc->blsthc", phi_q, moment_imag)
-                            if a_mode == "scalar":
-                                scale_chunk = a_coeff[q_start:q_end]
-                                acc_real_shc = (
-                                    torch.einsum("blst,blsthc,t->blshc", cos_p, b_real, scale_chunk)
-                                    - torch.einsum("blst,blsthc,t->blshc", sin_p, b_imag, scale_chunk)
-                                )
-                                acc_imag_shc = (
-                                    torch.einsum("blst,blsthc,t->blshc", cos_p, b_imag, scale_chunk)
-                                    + torch.einsum("blst,blsthc,t->blshc", sin_p, b_real, scale_chunk)
-                                )
-                            elif a_mode == "head":
-                                scale_chunk = a_coeff[:, q_start:q_end]
-                                acc_real_shc = (
-                                    torch.einsum("blst,blsthc,ht->blshc", cos_p, b_real, scale_chunk)
-                                    - torch.einsum("blst,blsthc,ht->blshc", sin_p, b_imag, scale_chunk)
-                                )
-                                acc_imag_shc = (
-                                    torch.einsum("blst,blsthc,ht->blshc", cos_p, b_imag, scale_chunk)
-                                    + torch.einsum("blst,blsthc,ht->blshc", sin_p, b_real, scale_chunk)
-                                )
-                            else:
-                                scale_chunk = a_coeff[:, :, q_start:q_end]
-                                if scale_chunk.shape[1] == 1 and C > 1:
-                                    scale_chunk = scale_chunk.expand(-1, C, -1)
-                                acc_real_shc = (
-                                    torch.einsum("blst,blsthc,hct->blshc", cos_p, b_real, scale_chunk)
-                                    - torch.einsum("blst,blsthc,hct->blshc", sin_p, b_imag, scale_chunk)
-                                )
-                                acc_imag_shc = (
-                                    torch.einsum("blst,blsthc,hct->blshc", cos_p, b_imag, scale_chunk)
-                                    + torch.einsum("blst,blsthc,hct->blshc", sin_p, b_real, scale_chunk)
-                                )
+                            if not self.a_per_l:
+                                a_coeff = a_coeff_list[0]
+                                if a_mode == "scalar":
+                                    scale_chunk = a_coeff[q_start:q_end]
+                                    acc_real_shc = (
+                                        torch.einsum("blst,blsthc,t->blshc", cos_p, b_real, scale_chunk)
+                                        - torch.einsum("blst,blsthc,t->blshc", sin_p, b_imag, scale_chunk)
+                                    )
+                                    acc_imag_shc = (
+                                        torch.einsum("blst,blsthc,t->blshc", cos_p, b_imag, scale_chunk)
+                                        + torch.einsum("blst,blsthc,t->blshc", sin_p, b_real, scale_chunk)
+                                    )
+                                elif a_mode == "head":
+                                    scale_chunk = a_coeff[:, q_start:q_end]
+                                    acc_real_shc = (
+                                        torch.einsum("blst,blsthc,ht->blshc", cos_p, b_real, scale_chunk)
+                                        - torch.einsum("blst,blsthc,ht->blshc", sin_p, b_imag, scale_chunk)
+                                    )
+                                    acc_imag_shc = (
+                                        torch.einsum("blst,blsthc,ht->blshc", cos_p, b_imag, scale_chunk)
+                                        + torch.einsum("blst,blsthc,ht->blshc", sin_p, b_real, scale_chunk)
+                                    )
+                                else:
+                                    scale_chunk = a_coeff[:, :, q_start:q_end]
+                                    if scale_chunk.shape[1] == 1 and C > 1:
+                                        scale_chunk = scale_chunk.expand(-1, C, -1)
+                                    acc_real_shc = (
+                                        torch.einsum("blst,blsthc,hct->blshc", cos_p, b_real, scale_chunk)
+                                        - torch.einsum("blst,blsthc,hct->blshc", sin_p, b_imag, scale_chunk)
+                                    )
+                                    acc_imag_shc = (
+                                        torch.einsum("blst,blsthc,hct->blshc", cos_p, b_imag, scale_chunk)
+                                        + torch.einsum("blst,blsthc,hct->blshc", sin_p, b_real, scale_chunk)
+                                    )
 
-                            for idx, W in enumerate(W_list):
-                                out_real_list[idx].add_(torch.einsum("blshc,sm->blhmc", acc_real_shc, W))
-                                out_imag_list[idx].add_(torch.einsum("blshc,sm->blhmc", acc_imag_shc, W))
+                                for idx, W in enumerate(W_list):
+                                    out_real_list[idx].add_(torch.einsum("blshc,sm->blhmc", acc_real_shc, W))
+                                    out_imag_list[idx].add_(torch.einsum("blshc,sm->blhmc", acc_imag_shc, W))
+                            else:
+                                for idx, (W, a_coeff_l) in enumerate(zip(W_list, a_coeff_list)):
+                                    if a_mode == "scalar":
+                                        scale_chunk = a_coeff_l[q_start:q_end]
+                                        acc_real_shc = (
+                                            torch.einsum("blst,blsthc,t->blshc", cos_p, b_real, scale_chunk)
+                                            - torch.einsum("blst,blsthc,t->blshc", sin_p, b_imag, scale_chunk)
+                                        )
+                                        acc_imag_shc = (
+                                            torch.einsum("blst,blsthc,t->blshc", cos_p, b_imag, scale_chunk)
+                                            + torch.einsum("blst,blsthc,t->blshc", sin_p, b_real, scale_chunk)
+                                        )
+                                    elif a_mode == "head":
+                                        scale_chunk = a_coeff_l[:, q_start:q_end]
+                                        acc_real_shc = (
+                                            torch.einsum("blst,blsthc,ht->blshc", cos_p, b_real, scale_chunk)
+                                            - torch.einsum("blst,blsthc,ht->blshc", sin_p, b_imag, scale_chunk)
+                                        )
+                                        acc_imag_shc = (
+                                            torch.einsum("blst,blsthc,ht->blshc", cos_p, b_imag, scale_chunk)
+                                            + torch.einsum("blst,blsthc,ht->blshc", sin_p, b_real, scale_chunk)
+                                        )
+                                    else:
+                                        scale_chunk = a_coeff_l[:, :, q_start:q_end]
+                                        if scale_chunk.shape[1] == 1 and C > 1:
+                                            scale_chunk = scale_chunk.expand(-1, C, -1)
+                                        acc_real_shc = (
+                                            torch.einsum("blst,blsthc,hct->blshc", cos_p, b_real, scale_chunk)
+                                            - torch.einsum("blst,blsthc,hct->blshc", sin_p, b_imag, scale_chunk)
+                                        )
+                                        acc_imag_shc = (
+                                            torch.einsum("blst,blsthc,hct->blshc", cos_p, b_imag, scale_chunk)
+                                            + torch.einsum("blst,blsthc,hct->blshc", sin_p, b_real, scale_chunk)
+                                        )
+                                    out_real_list[idx].add_(torch.einsum("blshc,sm->blhmc", acc_real_shc, W))
+                                    out_imag_list[idx].add_(torch.einsum("blshc,sm->blhmc", acc_imag_shc, W))
 
                         out_list = []
                         for idx, l_mod in enumerate(self._l_mod_4):

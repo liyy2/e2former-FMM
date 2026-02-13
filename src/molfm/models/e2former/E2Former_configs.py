@@ -144,6 +144,12 @@ class E2FormerBackboneConfigs:
     fmm_compute_dtype: str = "auto"  # auto|fp32|bf16|fp16
     # Optional per-head value bottleneck for node-only FMM (0 = disable).
     fmm_value_head_dim: int = 0
+    # Spectral radial-mixture controls for node-only/hybrid FMM branches.
+    fmm_learnable_radial_coeffs: bool = True
+    # one of: per_l_head | per_l_shared | head | shared
+    fmm_radial_coeffs_mode: str = "per_l_head"
+    fmm_radial_init_scale: float = 0.05
+    fmm_radial_low_kappa_bias: float = 2.0
     hybrid_long_scale_init: float = 1.0
     cluster_ckpt_path: str = ""
     with_cluster: bool = False

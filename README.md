@@ -31,6 +31,8 @@ $$
 $$
 f_\ell(r)\approx \sum_{q=1}^{Q} a_{\ell q}\,j_\ell(\kappa_q r).
 $$
+The mixture coefficients $a_{\ell q}$ are learnable in the node-FMM branch (default:
+per-$\ell$ per-head), initialized with small magnitude and a low-$\kappa$ bias.
 
 3. Plane-wave/spherical quadrature factorization:
 $$
@@ -93,6 +95,9 @@ Node-only FMM variant:
 - The default FMM radial band is configured by `fmm_num_kappa`, `fmm_kappa_min`,
   and `fmm_kappa_max` in the same config; the shipped defaults prioritize lower
   equivariance error at unchanged compute complexity.
+- Radial-mixture learning knobs:
+  `fmm_learnable_radial_coeffs`, `fmm_radial_coeffs_mode`,
+  `fmm_radial_init_scale`, `fmm_radial_low_kappa_bias`.
 
 Hybrid short+long variant:
 

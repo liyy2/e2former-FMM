@@ -56,7 +56,6 @@ Notation / index conventions used in this file:
     Q:     number of irrep components = (lmax+1)^2
     R_total: total output dimension of the TP = dim(irreps_ell x irreps_lambda)
 """
-import math
 import warnings
 
 import e3nn
@@ -109,6 +108,12 @@ class E2AttentionNodeFMM(nn.Module):
         fmm_value_head_dim: Optional value bottleneck per head (Cv). If > 0 and
             different from (scalar_dim / H), values are projected down before the
             FMM core and projected back afterwards (bias-free, equivariant).
+        fmm_learnable_radial_coeffs: If True, optimize spectral radial-mixture
+            coefficients during training.
+        fmm_radial_coeffs_mode: Layout of radial coefficients:
+            "per_l_head" | "per_l_shared" | "head" | "shared".
+        fmm_radial_init_scale: Initial coefficient scale (small values are safer).
+        fmm_radial_low_kappa_bias: Exponential low-frequency preference at init.
         (all other kwargs are accepted for interface compatibility but discarded)
     """
 
@@ -138,6 +143,10 @@ class E2AttentionNodeFMM(nn.Module):
         fmm_kappa_chunk_size: int = 0,
         fmm_compute_dtype: str | None = "auto",
         fmm_value_head_dim: int = 0,
+        fmm_learnable_radial_coeffs: bool = True,
+        fmm_radial_coeffs_mode: str = "per_l_head",
+        fmm_radial_init_scale: float = 0.05,
+        fmm_radial_low_kappa_bias: float = 2.0,
         **kwargs,
     ):
         super().__init__()
@@ -249,6 +258,15 @@ class E2AttentionNodeFMM(nn.Module):
                 f"fmm_kappa_max must be >= fmm_kappa_min, got "
                 f"{fmm_kappa_max} < {fmm_kappa_min}"
             )
+        if float(fmm_radial_init_scale) < 0.0:
+            raise ValueError(
+                f"fmm_radial_init_scale must be >= 0, got {fmm_radial_init_scale}"
+            )
+        if float(fmm_radial_low_kappa_bias) < 0.0:
+            raise ValueError(
+                "fmm_radial_low_kappa_bias must be >= 0, got "
+                f"{fmm_radial_low_kappa_bias}"
+            )
         # Radial basis: f_l(r) = sum_q a_q * j_l(kappa_q * r)
         # The compact default band (1.0..1.4) significantly reduces directional
         # quadrature aliasing (better equivariance) while keeping compute cost unchanged.
@@ -259,8 +277,16 @@ class E2AttentionNodeFMM(nn.Module):
             num_kappa,
             dtype=torch.float32,
         )
-        a = torch.ones(self.num_attn_heads, num_kappa, dtype=torch.float32) / math.sqrt(
-            float(num_kappa)
+        # Learnable spectral radial mixture. Initialize coefficients to be:
+        # - small amplitude (stable optimization at startup),
+        # - biased toward low-kappa components (better short/long separation).
+        a, a_per_l = self._build_initial_radial_coeffs(
+            lmax=self.lmax,
+            num_heads=self.num_attn_heads,
+            kappa=kappa,
+            mode=fmm_radial_coeffs_mode,
+            init_scale=float(fmm_radial_init_scale),
+            low_kappa_bias=float(fmm_radial_low_kappa_bias),
         )
 
         self.fmm_compute_dtype = fmm_compute_dtype
@@ -287,6 +313,8 @@ class E2AttentionNodeFMM(nn.Module):
             kappa_chunk_size=int(fmm_kappa_chunk_size),
             promote_half_precision=False,
             optimize_low_precision_sphere=True,
+            a_per_l=a_per_l,
+            learnable_a=bool(fmm_learnable_radial_coeffs),
         )
 
         # =====================================================================
@@ -588,6 +616,49 @@ class E2AttentionNodeFMM(nn.Module):
         if "tp_cueq" in tags or "cueq_tp" in tags:
             return "cueq"
         return "auto"
+
+    @staticmethod
+    def _build_initial_radial_coeffs(
+        *,
+        lmax: int,
+        num_heads: int,
+        kappa: torch.Tensor,
+        mode: str,
+        init_scale: float,
+        low_kappa_bias: float,
+    ) -> tuple[torch.Tensor, bool]:
+        """Build initial spectral-mixture coefficients with low-kappa preference.
+
+        Modes:
+            - "per_l_head":   shape (L, H, Q), one radial profile per (l, head)
+            - "per_l_shared": shape (L, Q),    one radial profile per l
+            - "head":         shape (H, Q),    shared over l, per-head
+            - "shared":       shape (Q,),      shared over l and heads
+        """
+        mode_norm = str(mode).strip().lower()
+        if mode_norm not in {"per_l_head", "per_l_shared", "head", "shared"}:
+            raise ValueError(
+                "fmm_radial_coeffs_mode must be one of "
+                "{'per_l_head','per_l_shared','head','shared'}, "
+                f"got {mode!r}"
+            )
+
+        # Normalize kappa into [0,1], then apply an exponential decay so lower
+        # frequencies get larger initial weights than high-frequency modes.
+        denom = (kappa.max() - kappa.min()).clamp_min(1e-6)
+        kappa_01 = (kappa - kappa.min()) / denom
+        low_kappa_profile = torch.exp(-float(low_kappa_bias) * kappa_01)
+        low_kappa_profile = low_kappa_profile / low_kappa_profile.sum().clamp_min(1e-8)
+        base = float(init_scale) * low_kappa_profile
+
+        num_l = int(lmax) + 1
+        if mode_norm == "per_l_head":
+            return base[None, None, :].repeat(num_l, int(num_heads), 1), True
+        if mode_norm == "per_l_shared":
+            return base[None, :].repeat(num_l, 1), True
+        if mode_norm == "head":
+            return base[None, :].repeat(int(num_heads), 1), False
+        return base.clone(), False
 
     @staticmethod
     def _build_tp_right_from_cueq(

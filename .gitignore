@@ -8,3 +8,5 @@ swanlog/
 
 pretrain_config.yaml
 AGENTS.md
+plan.md
+codex_monitor.sh
