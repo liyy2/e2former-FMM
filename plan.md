@@ -218,6 +218,91 @@ Active runs after resubmission:
   - key: `FMM_NUM_KAPPA=4`, `FMM_VALUE_HEAD_DIM=8`, learnable radial enabled
 
 Local run (requested batch size 8 + improved hyperparameter):
+
+## Update (2026-02-15)
+
+Storage quota cleanup after checkpoint write failures:
+- Root cause of recent job failures was confirmed as storage quota pressure while writing checkpoints (`PytorchStreamWriter failed writing file ...`, `Disk quota exceeded` on larger writes in `outputs/runs`).
+- Cleanup actions applied under `outputs/runs/md22_dwnt`:
+  - For run dirs with multiple `checkpoint_E*.pt`, kept only:
+    - latest epoch checkpoint
+    - `checkpoint_best.pt` target when present
+  - Rewrote `checkpoint_list.txt` in each pruned run dir to match remaining checkpoints.
+  - Removed older dated run directories (`YYYYMMDD < 20260212`) while preserving baseline-related paths.
+- Cleanup summary:
+  - `pruned_dirs=42`
+  - `removed_ckpt_files=16463`
+  - `removed_run_dirs=26`
+  - size reduced from `~1005G` to `~1.7G` in `outputs/runs/md22_dwnt`
+  - reclaimed bytes: `1,076,448,901,180`
+- Post-clean validation:
+  - large write test in `outputs/runs` succeeds (256 MB).
+
+## Update (2026-02-15) - Periodic test-set evaluation
+
+Implemented step-based test-set evaluation (distinct from validation):
+- Added new run config knob:
+  - `test_batch_interval` (default `20000` in `config_file/config_molfm.yaml`)
+- Pipeline changes:
+  - `TrainingLoop` now supports periodic `test()` calls during training when
+    `global_step % test_batch_interval == 0`.
+  - Added `test_data_loader` plumbing through execution engines.
+  - Added shared `_evaluate(..., split)` path used by both `validate()` and `test()`.
+- Slurm launcher defaults updated for MD22 FMM/hybrid workflows:
+  - `scripts/slurm_train_md22_dwnt_e2former_fmm_cueq.sbatch`
+  - `scripts/slurm_train_md22_dwnt_e2former_hybrid_cueq.sbatch`
+  - `scripts/slurm_train_md22_dwnt_e2former_hybrid_serial_cueq.sbatch`
+  - New env overrides:
+    - `TEST_BATCH_INTERVAL` (default `20000`)
+    - `VAL_BATCH_INTERVAL` (default `0`)
+    - `VAL_EPOCH_INTERVAL` (default `0`)
+  - These defaults disable periodic validation and use test-set checks at large step intervals.
+
+## Update (2026-02-15) - New FMM-strengthening Slurm matrix
+
+Reasoning from prior findings:
+- Serial 6+2 audit showed FMM branch is active but much smaller than local branch amplitude.
+- Likely improvements: reduce local dominance, increase global-depth usage, improve FMM numerical fidelity, and strengthen low-kappa radial initialization.
+
+Operational safeguard:
+- Added and used `save_epoch_interval=50` plus `test_batch_interval=20000` and disabled val-interval eval (`val_batch_interval=0`, `val_epoch_interval=0`) to avoid checkpoint-quota blowups.
+
+Replaced earlier quick-start jobs:
+- Cancelled: `1160097`, `1160098`, `1160099` (launched before the save-interval safeguard).
+
+Submitted jobs (all running at submit check):
+- `1160100` `dwnt_s6g2_count_ctrl`
+  - W&B: `dwnt_s6g2_count_ctrl_20260215_121259`
+  - Control: `first-order6+fmm-node2`, `nk=4`, `v_head_dim=8`, `coupling_norm=count`, `radius=15`, `neighbors=20`.
+- `1160101` `dwnt_s5g3_count`
+  - W&B: `dwnt_s5g3_count_20260215_121259`
+  - More global depth: `first-order5+fmm-node3` (same remaining knobs as control).
+- `1160102` `dwnt_s6g2_count_r10`
+  - W&B: `dwnt_s6g2_count_r10_20260215_121259`
+  - Weaker local branch: `radius=10`, `max_neighbors=24` (other knobs control-like).
+- `1160103` `dwnt_s6g2_count_fp32`
+  - W&B: `dwnt_s6g2_count_fp32_20260215_121259`
+  - Higher FMM fidelity: `fmm_compute_dtype=fp32`, stable LR (`4e-5/4e-6`), warmup `4000`.
+- `1160104` `dwnt_s6g2_count_radboost`
+  - W&B: `dwnt_s6g2_count_radboost_20260215_121259`
+  - Stronger low-kappa radial signal: `fmm_radial_init_scale=0.1`, `fmm_radial_low_kappa_bias=3.0`, stable LR (`4e-5/4e-6`), warmup `4000`.
+
+Shared launch context for this matrix:
+- Script: `scripts/slurm_train_md22_dwnt_e2former_hybrid_serial_cueq.sbatch`
+- `TOTAL_NUM_STEPS=100000`, `SAVE_EPOCH_INTERVAL=50`, `TEST_BATCH_INTERVAL=20000`.
+- Excluded low-end GPU nodes (`a40/l40s` family) to reduce hardware variance.
+
+## Update (2026-02-15) - Validation default made frequent again
+
+Adjusted Slurm launcher defaults to restore frequent epoch validation while keeping step-based test:
+- Updated:
+  - `scripts/slurm_train_md22_dwnt_e2former_hybrid_serial_cueq.sbatch`
+  - `scripts/slurm_train_md22_dwnt_e2former_hybrid_cueq.sbatch`
+  - `scripts/slurm_train_md22_dwnt_e2former_fmm_cueq.sbatch`
+- New defaults:
+  - `VAL_EPOCH_INTERVAL=10` (was `0`)
+  - `VAL_BATCH_INTERVAL=0` (unchanged)
+  - `TEST_BATCH_INTERVAL=20000` (unchanged)
 - Session: `dwnt_local_bs8_nk4_20260212_011625`
 - Log: `outputs/local_tmux/dwnt_local_bs8_nk4_20260212_011625.log`
 - Save dir: `outputs/runs/md22_dwnt/dwnt_local_bs8_nk4_20260212_011625`
@@ -335,4 +420,290 @@ Slurm serial hybrid (learnable radial mixture, explicit overrides):
 sbatch --job-name=dwnt_serial_learnrad \
   --export=ALL,FMM_LEARNABLE_RADIAL_COEFFS=true,FMM_RADIAL_COEFFS_MODE=per_l_head,FMM_RADIAL_INIT_SCALE=0.05,FMM_RADIAL_LOW_KAPPA_BIAS=2.0,FMM_VALUE_HEAD_DIM=8,FMM_NUM_KAPPA=6,FMM_KAPPA_MIN=0.8,FMM_KAPPA_MAX=1.2,FMM_NUM_DIRECTIONS=16,FMM_COMPUTE_DTYPE=bf16 \
   scripts/slurm_train_md22_dwnt_e2former_hybrid_serial_cueq.sbatch
+```
+
+## Update (2026-02-13) - Serial FMM Branch Magnitude Audit
+
+Run inspected:
+- `dwnt_serial_nk4_learnrad_v8_h200x2_20260212_010116`
+  - local W&B run dir: `wandb/run-20260212_010214-uqo196t3`
+  - best by `force_loss` in log: `checkpoint_E956.pt` (`force_loss=0.428529`)
+  - best by `valid_loss` in log: `checkpoint_E988.pt` (`valid_loss=0.351276`)
+  - latest inspected: `checkpoint_E1067.pt`
+
+Findings from per-layer norm probe on a validation sample (`num_atoms=370`):
+- This run is serial (`attn_type=first-order6+fmm-node2`), so there is no hybrid `long_scale` gate parameter in checkpoint.
+- Local layers (`0..5`) attention branch magnitude (`ga_out`) RMS: ~`0.042` average.
+- FMM layers (`6,7`) attention branch magnitude RMS: ~`0.0030` to `0.0041`.
+  - Relative to local branch reference: `~0.07` to `0.10` (about 10-14x smaller).
+  - Relative to residual stream RMS at layers 6-7: `ga/residual ~0.006-0.007`.
+- Norm placement did not show collapse of input scale before FMM:
+  - `norm1_out/residual` at layers 6-7 stayed around `1.6-1.8` (not near zero).
+- FMM radial coefficient tensor magnitude was not near-zero:
+  - `blocks.6.ga.fmm_multi_l.a` mean `|a| ~ 0.13`
+  - `blocks.7.ga.fmm_multi_l.a` mean `|a| ~ 0.11`
+
+Interpretation:
+- The FMM branch is active but very weak in amplitude versus local attention in this serial setup.
+- The issue is unlikely to be a stuck zero-initialized scalar gate in this run (none exists in serial mode).
+
+## Update (2026-02-13) - Added FMM coupling normalization mode
+
+- Added new knob: `backbone_config.fmm_coupling_norm` with options:
+  - `count` (existing behavior, divide by coupling count)
+  - `sqrt` (divide by sqrt of coupling count)
+  - `none` (no coupling-count normalization)
+- Wired through:
+  - `src/molfm/models/e2former/fmm_e2former.py`
+  - `src/molfm/models/e2former/e2former.py`
+  - `config_file/backbone_config/e2former_fmm.yaml`
+  - `config_file/backbone_config/e2former_hybrid.yaml`
+  - Slurm launchers + benchmark helper for easy override.
+
+Reproduction commands:
+
+```bash
+# Serial hybrid run with sqrt coupling normalization
+sbatch --job-name=dwnt_serial_sqrt \
+  --export=ALL,FMM_COUPLING_NORM=sqrt \
+  scripts/slurm_train_md22_dwnt_e2former_hybrid_serial_cueq.sbatch
+
+# FMM-only run with sqrt coupling normalization
+sbatch --job-name=dwnt_fmm_sqrt \
+  --export=ALL,FMM_COUPLING_NORM=sqrt \
+  scripts/slurm_train_md22_dwnt_e2former_fmm_cueq.sbatch
+```
+
+## Update (2026-02-12 22:40 EST) - No-Norm run launched
+
+- Submitted no-norm serial run:
+  - Job ID: `1156744`
+  - Job name: `dwnt_serial_nonorm`
+  - Scheduler state at submit check: `PD (Priority)`
+  - Override: `FMM_COUPLING_NORM=none`
+  - W&B run name: `dwnt_serial_nonorm_20260212_224026`
+- Submit command:
+
+```bash
+sbatch --job-name=dwnt_serial_nonorm \
+  --export=ALL,FMM_COUPLING_NORM=none,WANDB_RUN_NAME=dwnt_serial_nonorm_20260212_224026 \
+  scripts/slurm_train_md22_dwnt_e2former_hybrid_serial_cueq.sbatch
+```
+
+## Update (2026-02-12 22:40 EST) - Sqrt run launched + default switched
+
+- Submitted sqrt serial run:
+  - Job ID: `1156749`
+  - Job name: `dwnt_serial_sqrt`
+  - Initial state: `R` on `r4518u09n01`
+  - Override: `FMM_COUPLING_NORM=sqrt`
+  - W&B run name: `dwnt_serial_sqrt_20260212_224215`
+- Submit command:
+
+```bash
+sbatch --job-name=dwnt_serial_sqrt \
+  --export=ALL,FMM_COUPLING_NORM=sqrt,WANDB_RUN_NAME=dwnt_serial_sqrt_20260212_224215 \
+  scripts/slurm_train_md22_dwnt_e2former_hybrid_serial_cueq.sbatch
+```
+
+- Changed defaults to `sqrt` for future runs:
+  - `src/molfm/models/e2former/fmm_e2former.py`
+  - `src/molfm/models/e2former/e2former.py`
+  - `config_file/backbone_config/e2former_fmm.yaml`
+  - `config_file/backbone_config/e2former_hybrid.yaml`
+  - `scripts/slurm_train_md22_dwnt_e2former_fmm_cueq.sbatch`
+  - `scripts/slurm_train_md22_dwnt_e2former_hybrid_cueq.sbatch`
+  - `scripts/slurm_train_md22_dwnt_e2former_hybrid_serial_cueq.sbatch`
+  - `scripts/benchmark_e2former_fmm_variant.py`
+
+## Update (2026-02-13) - Removed forced fp32 Q/K cast in FMM
+
+- In `src/molfm/models/e2former/fmm_e2former.py`, removed the explicit
+  `packed_irreps.to(torch.float32)` before `q_proj/k_proj`.
+- Q/K now use the incoming dtype so AMP/autocast can control precision.
+
+## Update (2026-02-13) - Default `fmm_value_head_dim` set to 8
+
+- Switched the default value bottleneck from `0` to `8` for future FMM/hybrid runs.
+- Updated in:
+  - `src/molfm/models/e2former/fmm_e2former.py`
+  - `src/molfm/models/e2former/e2former.py`
+  - `src/molfm/models/e2former/E2Former_configs.py`
+  - `config_file/backbone_config/e2former_fmm.yaml`
+  - `config_file/backbone_config/e2former_hybrid.yaml`
+  - `scripts/slurm_train_md22_dwnt_e2former_hybrid_serial_cueq.sbatch`
+  - `scripts/benchmark_e2former_fmm_variant.py`
+
+## Update (2026-02-15) - New 6+2 serial-hybrid stability/quality matrix launched
+
+Evidence-based hypothesis (from current `md22_dwnt` runs):
+- Best finished 6+2 run remains `2otro7n7` with `nk=4`, `v_head_dim=8`, and legacy/default coupling behavior (pre-`sqrt` default switch).
+- Post-switch `sqrt`/`none` runs (`mgoyn7qw`, `39xsu6kv`) underperformed and failed earlier, but `sqrt + nk=4` families showed some upside when stabilized.
+- Main risk appears to be late-stage instability rather than immediate divergence.
+
+Code-side launcher improvement:
+- Added `HYBRID_LONG_SCALE_INIT` override support to:
+  - `scripts/slurm_train_md22_dwnt_e2former_hybrid_serial_cueq.sbatch`
+- Plumbed to Hydra:
+  - `backbone_config.hybrid_long_scale_init="${HYBRID_LONG_SCALE_INIT}"`
+
+Submitted Slurm runs (all currently `RUNNING` at submit check):
+- `1160080` `dwnt_s6g2_count_ctrl`
+  - W&B: `dwnt_s6g2_count_ctrl_20260215_105352`
+  - Purpose: control arm close to best known 6+2 recipe.
+  - Overrides: `nk=4`, `v_head_dim=8`, `coupling_norm=count`, `lr=5e-5/5e-6`, `radius=15`, `neighbors=20`, `hybrid_long_scale_init=1.0`.
+- `1160081` `dwnt_s6g2_sqrt_stable`
+  - W&B: `dwnt_s6g2_sqrt_stable_20260215_105352`
+  - Purpose: test whether `sqrt` can work with extra stability bias.
+  - Overrides: `nk=4`, `v_head_dim=8`, `coupling_norm=sqrt`, `lr=4e-5/4e-6`, `warmup=4000`, `hybrid_long_scale_init=0.5`.
+- `1160082` `dwnt_s6g2_count_r12`
+  - W&B: `dwnt_s6g2_count_r12_20260215_105352`
+  - Purpose: force more long-range burden onto FMM.
+  - Overrides: `nk=4`, `v_head_dim=8`, `coupling_norm=count`, `radius=12`, `pbc_radius=12`, `max_neighbors=32`, `lr=5e-5/5e-6`.
+- `1160083` `dwnt_s6g2_count_v16`
+  - W&B: `dwnt_s6g2_count_v16_20260215_105352`
+  - Purpose: test higher FMM value capacity with stability-leaning LR.
+  - Overrides: `nk=4`, `v_head_dim=16`, `coupling_norm=count`, `lr=4e-5/4e-6`, `warmup=4000`, `hybrid_long_scale_init=0.7`.
+
+Local tmux run:
+- First launch attempt failed immediately due DeepSpeed CUDA op probe:
+  - Error: `MissingCUDAException: CUDA_HOME does not exist`.
+- Relaunched successfully with `DS_ACCELERATOR=cpu` (matching Slurm scripts):
+  - Session: `dwnt_local_s6g2_count_r12_20260215_105527`
+  - W&B: `dwnt_local_s6g2_count_r12_20260215_105527`
+  - Log: `outputs/local_tmux/dwnt_local_s6g2_count_r12_20260215_105527.log`
+  - Save dir: `outputs/runs/md22_dwnt/local_tmux/dwnt_local_s6g2_count_r12_20260215_105527`
+  - Config: `first-order6+fmm-node2`, `nk=4`, `v_head_dim=8`, `coupling_norm=coreunt`,
+    `radius=12`, `max_neighbors=32`, `train_batch_size=8`, `total_num_steps=80000`, `seed=59`.
+
+## Update (2026-02-18) - True Resume Relaunch + From-Scratch LR Sweep
+
+Queue triage snapshot:
+- `gpu` partition currently had idle `a100` node(s), so submissions were pinned to `--gres=gpu:a100:4` for faster start.
+
+Stateful resume intent:
+- Initial submissions `1166122/1166123/1166124` used `LOADCHECK_PATH` and started from loaded weights, but did **not** restore optimizer/global-step state (`Start Training for epoch: 0`).
+- These were canceled and replaced with true stateful resumes by reusing the original `SAVE_DIR` that already contains `checkpoint_list.txt`.
+
+True stateful resume jobs:
+- `1166128` `dwnt_r10_true_resume`
+  - Save dir reused: `outputs/runs/md22_dwnt/hybrid_serial_cueq/dwnt_s6g2_count_r10_20260215_121259`
+  - Target: extend to `TOTAL_NUM_STEPS=160000`
+  - Key knobs: `radius=10`, `neighbors=24`, `nk=4`, `v_head_dim=8`, `coupling_norm=count`, `lr=5e-5/5e-6`
+- `1166129` `dwnt_r15_true_resume`
+  - Save dir reused: `outputs/runs/md22_dwnt/hybrid_serial_cueq/dwnt_s6g2_count_ctrl_20260215_121259`
+  - Target: extend to `TOTAL_NUM_STEPS=160000`
+  - Key knobs: `radius=15`, `neighbors=20`, `nk=4`, `v_head_dim=8`, `coupling_norm=count`, `lr=5e-5/5e-6`
+
+From-scratch LR sweep (r10 recipe):
+- `1166125` `dwnt_r10_fs_lr45` (`MAX_LR=4.5e-5`, `MIN_LR=4.5e-6`)
+- `1166126` `dwnt_r10_fs_lr50` (`MAX_LR=5.0e-5`, `MIN_LR=5.0e-6`)
+- `1166127` `dwnt_r10_fs_lr55` (`MAX_LR=5.5e-5`, `MIN_LR=5.5e-6`)
+- Shared sweep setup:
+  - `TOTAL_NUM_STEPS=80000`, `SAVE_EPOCH_INTERVAL=100`, `VAL_EPOCH_INTERVAL=0`, `TEST_BATCH_INTERVAL=20000`
+  - `first-order6+fmm-node2`, `radius=10`, `neighbors=24`
+  - `nk=4`, `kappa=[0.8,1.2]`, `dirs=16`, `dtype=bf16`, `v_head_dim=8`, `coupling_norm=count`, `seed=59`
+
+Local tmux true resume:
+- Session: `dwnt_local_r10_state_resume_20260218_013331`
+- Log: `outputs/local_tmux/dwnt_local_r10_state_resume_20260218_013331.log`
+- Save dir: `outputs/runs/md22_dwnt/local_tmux/dwnt_local_r10_state_resume_20260218_013331`
+- Bootstrap for stateful local resume:
+  - copied `checkpoint_E900.pt` from the r10 run into local save dir
+  - wrote `checkpoint_list.txt` with `checkpoint_E900.pt`
+  - launched with `ifresume=True`, observed:
+    - `Resume from checkpoint: .../checkpoint_E900.pt`
+    - `Start Training for epoch: 900`
+
+## Update (2026-02-18 13:02 EST) - Recent W&B analysis + best-run stateful resume
+
+Recent-run scope and normalization:
+- W&B scope: entity/project/group = `yl2428/ffm/md22_dwnt`, `createdAt > 2026-02-18T00:00:00Z`.
+- Primary objective: minimize `test/force_loss` when available (evaluation-aligned).
+- Fallback comparison for active from-scratch LR sweep used normalized horizon at `_step<=6555`
+  (same effective batch across runs): `min(train/loss)` up to horizon.
+
+Recent run snapshot:
+- `1a6ufx5k` (`dwnt_local_r10_state_resume_20260218_013331`, crashed):
+  `test/force_loss=0.4589`, `test/valid_loss=0.3695`, `_step=145635` (best available eval).
+- `ttkxc4rs` (`dwnt_r10_fs_lr45_20260218_013050`, running):
+  `test/force_loss=0.9065`, `_step=27075`.
+- `1ca5w93l` (`dwnt_r10_fs_lr50_20260218_013050`, running):
+  `_step=6650`, no test metric yet; normalized `_step<=6555` `min(train/loss)~1.3777`.
+- `uc9610fp` (`dwnt_r10_fs_lr55_20260218_013050`, running):
+  `_step=285` (too early/incomplete for ranking).
+
+Chosen resume target (best recent eval run):
+- Run id: `1a6ufx5k`
+- Save dir (reused for true stateful resume):
+  `outputs/runs/md22_dwnt/local_tmux/dwnt_local_r10_state_resume_20260218_013331`
+- Latest checkpoint in `checkpoint_list.txt`: `checkpoint_E1500.pt`
+
+Submitted resume job:
+- Job ID: `1166968`
+- Job name: `dwnt_best_resume`
+- W&B run name: `dwnt_r10_best_resume_20260218_130152`
+- State after submit check: `PENDING (QOSMaxGRESPerUser)`
+- Submit command:
+```bash
+sbatch --job-name=dwnt_best_resume \
+  --export=ALL,WANDB_RUN_NAME=dwnt_r10_best_resume_20260218_130152,SAVE_DIR=/gpfs/radev/project/gerstein/yl2428/yl2428/e2former-FMM/outputs/runs/md22_dwnt/local_tmux/dwnt_local_r10_state_resume_20260218_013331,TOTAL_NUM_STEPS=160000,SAVE_EPOCH_INTERVAL=100,VAL_EPOCH_INTERVAL=0,VAL_BATCH_INTERVAL=0,TEST_BATCH_INTERVAL=20000,MAX_LR=5e-5,MIN_LR=5e-6,WARMUP_STEPS=2000,SEED=59,MAX_RADIUS=10.0,PBC_MAX_RADIUS=10.0,MAX_NEIGHBORS=24,FMM_NUM_KAPPA=4,FMM_KAPPA_MIN=0.8,FMM_KAPPA_MAX=1.2,FMM_NUM_DIRECTIONS=16,FMM_COMPUTE_DTYPE=bf16,FMM_KAPPA_CHUNK_SIZE=0,FMM_VALUE_HEAD_DIM=8,FMM_LEARNABLE_RADIAL_COEFFS=true,FMM_RADIAL_COEFFS_MODE=per_l_head,FMM_RADIAL_INIT_SCALE=0.05,FMM_RADIAL_LOW_KAPPA_BIAS=2.0,FMM_COUPLING_NORM=count,HYBRID_LONG_SCALE_INIT=1.0 \
+  scripts/slurm_train_md22_dwnt_e2former_hybrid_serial_cueq.sbatch
+```
+
+## Update (2026-02-18 13:06 EST) - Local tmux stateful resume launched from best run
+
+Local resume launch:
+- Session: `dwnt_local_best_resume_20260218_130359`
+- W&B run name: `dwnt_local_best_resume_20260218_130359`
+- Runtime script: `/tmp/dwnt_local_best_resume_20260218_130359.sh`
+- Log: `outputs/local_tmux/dwnt_local_best_resume_20260218_130359.log`
+- Save dir reused (true stateful): `outputs/runs/md22_dwnt/local_tmux/dwnt_local_r10_state_resume_20260218_013331`
+
+Startup verification:
+- tmux session running and GPU process attached (`~55.8 GiB` on `CUDA_VISIBLE_DEVICES=0`).
+- Log confirms:
+  - `Resume from checkpoint: .../checkpoint_E1500.pt`
+  - `optimizer is loaded from checkpoint checkpoint_E1500.pt`
+  - `Start Training for epoch: 1500`
+  - first resumed train log at epoch 1500 and checkpoint rewrite `checkpoint_E1500.pt`.
+
+## Update (2026-02-18 13:54 EST) - Hybrid Muon optimizer path (hidden 2D only)
+
+Implemented optimizer option:
+- Added `optimizer_name` (`adamw|muon`) in run config.
+- Added Muon hyperparameters:
+  - `muon_beta` (default `0.95`)
+  - `muon_ns_steps` (default `5`)
+  - `muon_ns_eps` (default `1e-7`)
+  - `muon_nesterov` (default `True`)
+- Added `MuonAdamW` optimizer in `src/molfm/models/molfm_optimizer.py`.
+  - `optim_type='muon'` groups use Newton-Schulz orthogonalized updates.
+  - `optim_type='adamw'` groups use AdamW updates.
+
+Hidden-layer selection criterion used for Muon:
+- Parameter must satisfy all:
+  - `requires_grad=True`
+  - tensor rank `ndim == 2`
+  - name suffix `*.weight`
+  - name prefix `decoder.decoder.blocks.`
+
+Parameter identification snapshots:
+- Baseline first-order config (`backbone_config=e2former`): `120` Muon-selected params.
+- MD22 serial-hybrid config (`first-order6+fmm-node2`, `nk=4`, `v_head_dim=8`): `104` Muon-selected params.
+  - Blocks `0..5`: `14` selected GA weights/block + `1` FFN gating weight/block.
+  - Blocks `6..7` (FMM blocks): `6` selected GA weights/block + `1` FFN gating weight/block.
+
+Reproduction / smoke checks:
+```bash
+PYTHONPATH=./src python -m compileall \
+  src/molfm/models/molfm_optimizer.py \
+  src/molfm/tasks/train_molfm.py \
+  src/molfm/pipeline/schema.py
+```
+
+```bash
+source /gpfs/radev/apps/avx512/software/miniconda/24.3.0-miniforge/etc/profile.d/conda.sh
+conda activate /gpfs/radev/project/gerstein/yl2428/yl2428/e2former-FMM/.conda/envs/e2former-cueq
+DS_ACCELERATOR=cpu PYTHONPATH=./src python /tmp/smoke_muon_optimizer.py
 ```

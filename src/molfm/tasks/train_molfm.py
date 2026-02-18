@@ -29,7 +29,12 @@ from molfm.logging import logger
 from molfm.models.e2former.E2Former import E2FormerBackbone
 
 from molfm.models.molfm_config import MOLFMConfig
-from molfm.models.molfm_optimizer import DECAY_COSINE_RATE, groupWarmupDecayLR, myAdam
+from molfm.models.molfm_optimizer import (
+    DECAY_COSINE_RATE,
+    MuonAdamW,
+    groupWarmupDecayLR,
+    myAdam,
+)
 from molfm.pipeline.schema import DistributedConfig, StepOutput
 from molfm.pipeline.loop import TrainingLoop, CoreModule, seed_all
 from molfm.tasks.heads import MOLFM_FT_REGISTER
@@ -90,6 +95,61 @@ class SmallMolConfig(DistributedConfig, MOLFMConfig):
 
 cs = ConfigStore.instance()
 cs.store(name="config_molfm_schema", node=SmallMolConfig)
+
+_MUON_HIDDEN_PREFIX = "decoder.decoder.blocks."
+
+
+def _is_muon_hidden_2d_weight(name: str, param: torch.nn.Parameter) -> bool:
+    return (
+        param.requires_grad
+        and param.ndim == 2
+        and name.endswith(".weight")
+        and name.startswith(_MUON_HIDDEN_PREFIX)
+    )
+
+
+def _build_muon_param_groups(model: nn.Module):
+    muon_params = []
+    muon_names = []
+    head_params = []
+    other_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        is_head = (
+            name.startswith("molfm_finetune_head.")
+            or ("energy_head" in name)
+            or ("force_head" in name)
+            or ("forces_head" in name)
+        )
+        if _is_muon_hidden_2d_weight(name, param) and not is_head:
+            muon_params.append(param)
+            muon_names.append(name)
+        elif is_head:
+            head_params.append(param)
+        else:
+            other_params.append(param)
+
+    # Keep a stable 3-group layout:
+    #   group 0: Muon-selected hidden 2D weights
+    #   group 1: finetune heads (AdamW)
+    #   group 2: all remaining params (AdamW)
+    # This preserves scheduler assumptions that group index 1 exists.
+    param_groups = [
+        {"params": muon_params, "optim_type": "muon"},
+        {"params": head_params, "optim_type": "adamw"},
+        {"params": other_params, "optim_type": "adamw"},
+    ]
+
+    stats = {
+        "muon_param_count": len(muon_params),
+        "head_param_count": len(head_params),
+        "other_param_count": len(other_params),
+        "muon_names": muon_names,
+    }
+    return param_groups, stats
 
 
 def _resolve_md22_sample_size(
@@ -602,15 +662,44 @@ def finetune(cfg: DictConfig) -> None:
     # Define model
     model = MOLFMModel_Atomic(args, loss_fn=Identity, molfm_finetune_head=head_module)
 
-    # Define optimizer
-    optimizer = myAdam(
-        model,
-        impl=Adam if args.weight_decay == 0 else AdamW,
-        lr=args.max_lr,
-        betas=[0.9, 0.999],
-        weight_decay=args.weight_decay,
-        eps=1e-8,
-    )
+    optimizer_name = getattr(args, "optimizer_name", "adamw").lower()
+    if optimizer_name == "muon":
+        param_groups, muon_stats = _build_muon_param_groups(model)
+        optimizer = MuonAdamW(
+            param_groups,
+            lr=args.max_lr,
+            betas=(args.beta1, args.beta2),
+            eps=args.eps,
+            weight_decay=args.weight_decay,
+            muon_beta=getattr(args, "muon_beta", 0.95),
+            muon_ns_steps=getattr(args, "muon_ns_steps", 5),
+            muon_ns_eps=getattr(args, "muon_ns_eps", 1e-7),
+            muon_nesterov=getattr(args, "muon_nesterov", True),
+        )
+        logger.info(
+            "Using MuonAdamW: {} hidden 2D weights (Muon), {} head params (AdamW), {} other params (AdamW).",
+            muon_stats["muon_param_count"],
+            muon_stats["head_param_count"],
+            muon_stats["other_param_count"],
+        )
+        if muon_stats["muon_param_count"] == 0:
+            logger.warning(
+                "optimizer_name=muon but no parameters matched hidden 2D criterion "
+                "('{}*.weight'). Falling back effectively to AdamW groups.",
+                _MUON_HIDDEN_PREFIX,
+            )
+        else:
+            logger.info("Muon parameter examples: {}", muon_stats["muon_names"][:10])
+    else:
+        # Default behavior: Adam/AdamW over all trainable params.
+        optimizer = myAdam(
+            model,
+            impl=Adam if args.weight_decay == 0 else AdamW,
+            lr=args.max_lr,
+            betas=[args.beta1, args.beta2],
+            weight_decay=args.weight_decay,
+            eps=args.eps,
+        )
 
     lr_scheduler = groupWarmupDecayLR(
         optimizer,

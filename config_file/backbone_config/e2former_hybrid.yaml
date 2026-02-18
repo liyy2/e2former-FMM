@@ -53,7 +53,9 @@ fmm_num_directions: 25
 fmm_kappa_chunk_size: 0
 fmm_compute_dtype: "auto" # auto|fp32|bf16|fp16
 # Optional per-head V bottleneck for the long-range FMM branch (0 = disable).
-fmm_value_head_dim: 0
+fmm_value_head_dim: 8
+# Coupling-path normalization in FMM TP aggregation: count|sqrt|none
+fmm_coupling_norm: "sqrt"
 # Learnable spectral radial-mixture coefficients for the long-range branch.
 fmm_learnable_radial_coeffs: true
 # per_l_head | per_l_shared | head | shared

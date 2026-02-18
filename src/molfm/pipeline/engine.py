@@ -345,7 +345,7 @@ class ExecutionEngine(ABC):
         pass
 
     @abstractmethod
-    def build_data_loader(self, train_data, val_data):
+    def build_data_loader(self, train_data, val_data, test_data=None):
         pass
 
     @abstractmethod
@@ -457,7 +457,7 @@ class SingleProcessEngine(ExecutionEngine):
         pass
 
     def build_data_loader(
-        self, train_data, valid_data
+        self, train_data, valid_data, test_data=None
     ):
         train_batch_size_per_gpu = self.args.train_batch_size // (
             self.world_size * self.args.gradient_accumulation_steps
@@ -492,6 +492,22 @@ class SingleProcessEngine(ExecutionEngine):
             )
         else:
             self.valid_data_loader = None
+
+        if test_data:
+            test_batch_size_per_gpu = self.args.val_batch_size // self.world_size
+            assert (
+                test_batch_size_per_gpu > 0
+            ), "test_batch_size_per_gpu should be greater than 0"
+
+            self.test_data_loader = DataLoader(
+                test_data,
+                sampler=None,
+                batch_size=test_batch_size_per_gpu,
+                collate_fn=test_data.collate,
+                drop_last=False,
+            )
+        else:
+            self.test_data_loader = None
 
     def train_step(self, grouped_batch_data: List[SampleBatch]) -> StepOutput:
         assert grouped_batch_data, "grouped_batch_data is empty"
@@ -779,7 +795,7 @@ class DistributedEngine(SingleProcessEngine):
         return model_output
 
     def build_data_loader(
-        self, train_data, val_data
+        self, train_data, val_data, test_data=None
     ):
         train_batch_size_per_gpu = self.args.train_batch_size // (
             self.world_size * self.args.gradient_accumulation_steps
@@ -877,6 +893,45 @@ class DistributedEngine(SingleProcessEngine):
                 )
         else:
             self.valid_data_loader = None
+
+        if test_data:
+            if self.args.use_unified_batch_sampler:
+                test_sampler = ProportionalSampler(
+                    test_data,
+                    self.args.dataset_split_raito,
+                    self.args.dataset_micro_batch_size,
+                    num_replicas=self.world_size,
+                    rank=self.rank,
+                    seed=self.args.seed,
+                )
+                self.test_data_loader = DataLoader(
+                    test_data,
+                    batch_sampler=test_sampler,
+                    collate_fn=test_data.collate,
+                )
+            elif self.args.use_dali_pipeline:
+                self.test_data_loader = DataLoader(
+                    test_data,
+                    batch_size=None,
+                    collate_fn=test_data.collate,
+                )
+            else:
+                test_batch_size_per_gpu = self.args.val_batch_size // self.world_size
+                assert (
+                    test_batch_size_per_gpu > 0
+                ), "test_batch_size_per_gpu should be greater than 0"
+                testsampler = torch.utils.data.distributed.DistributedSampler(
+                    test_data, num_replicas=self.world_size, shuffle=False
+                )
+                self.test_data_loader = DataLoader(
+                    test_data,
+                    sampler=testsampler,
+                    batch_size=test_batch_size_per_gpu,
+                    collate_fn=test_data.collate,
+                    drop_last=False,
+                )
+        else:
+            self.test_data_loader = None
 
     def before_epoch(self, epoch: int):
         if self.train_sampler is not None:

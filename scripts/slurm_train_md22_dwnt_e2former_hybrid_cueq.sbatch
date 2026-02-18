@@ -51,9 +51,13 @@ DATASET_NAME="${DATASET_NAME:-md}"
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/outputs/runs/md22_dwnt/hybrid_cueq}"
 TOTAL_NUM_STEPS="${TOTAL_NUM_STEPS:-200000}"
 TOTAL_NUM_EPOCHS="${TOTAL_NUM_EPOCHS:-3000}"
+SAVE_EPOCH_INTERVAL="${SAVE_EPOCH_INTERVAL:-50}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-2}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
+TEST_BATCH_INTERVAL="${TEST_BATCH_INTERVAL:-20000}"
+VAL_BATCH_INTERVAL="${VAL_BATCH_INTERVAL:-0}"
+VAL_EPOCH_INTERVAL="${VAL_EPOCH_INTERVAL:-10}"
 MAX_LR="${MAX_LR:-5e-5}"
 MIN_LR="${MIN_LR:-5e-6}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
@@ -68,6 +72,7 @@ WANDB_RUN_NAME="${WANDB_RUN_NAME:-dwnt_e2former_hybrid_cueq_${SLURM_JOB_ID:-loca
 FMM_NUM_KAPPA="${FMM_NUM_KAPPA:-6}"
 FMM_KAPPA_MIN="${FMM_KAPPA_MIN:-0.8}"
 FMM_KAPPA_MAX="${FMM_KAPPA_MAX:-1.2}"
+FMM_COUPLING_NORM="${FMM_COUPLING_NORM:-sqrt}" # count|sqrt|none
 HYBRID_LONG_SCALE_INIT="${HYBRID_LONG_SCALE_INIT:-0.05}"
 LOADCHECK_PATH="${LOADCHECK_PATH:-}"
 
@@ -76,6 +81,7 @@ mkdir -p "${SAVE_DIR}"
 echo "Running E2Former-Hybrid(local+FMM-cueq) on MD22 double_walled_nanotube"
 echo "Data: ${DATA_DIR}/${DATA_FILE}"
 echo "Save dir: ${SAVE_DIR}"
+echo "Eval: test_batch_interval=${TEST_BATCH_INTERVAL} val_batch_interval=${VAL_BATCH_INTERVAL} val_epoch_interval=${VAL_EPOCH_INTERVAL} save_epoch_interval=${SAVE_EPOCH_INTERVAL}"
 
 python -m torch.distributed.run \
   --nproc_per_node=1 \
@@ -99,6 +105,7 @@ python -m torch.distributed.run \
   backbone_config.fmm_num_kappa="${FMM_NUM_KAPPA}" \
   backbone_config.fmm_kappa_min="${FMM_KAPPA_MIN}" \
   backbone_config.fmm_kappa_max="${FMM_KAPPA_MAX}" \
+  backbone_config.fmm_coupling_norm="${FMM_COUPLING_NORM}" \
   backbone_config.hybrid_long_scale_init="${HYBRID_LONG_SCALE_INIT}" \
   max_lr="${MAX_LR}" \
   min_lr="${MIN_LR}" \
@@ -112,6 +119,10 @@ python -m torch.distributed.run \
   dataset_micro_batch_size=1 \
   shuffle=True \
   use_unified_batch_sampler=False \
+  test_batch_interval="${TEST_BATCH_INTERVAL}" \
+  val_batch_interval="${VAL_BATCH_INTERVAL}" \
+  val_epoch_interval="${VAL_EPOCH_INTERVAL}" \
+  save_epoch_interval="${SAVE_EPOCH_INTERVAL}" \
   total_num_steps="${TOTAL_NUM_STEPS}" \
   total_num_epochs="${TOTAL_NUM_EPOCHS}" \
   train_batch_size="${TRAIN_BATCH_SIZE}" \

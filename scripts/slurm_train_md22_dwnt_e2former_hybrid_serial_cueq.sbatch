@@ -63,7 +63,11 @@ DATASET_NAME="${DATASET_NAME:-md}"
 
 TOTAL_NUM_STEPS="${TOTAL_NUM_STEPS:-200000}"
 TOTAL_NUM_EPOCHS="${TOTAL_NUM_EPOCHS:-3000}"
+SAVE_EPOCH_INTERVAL="${SAVE_EPOCH_INTERVAL:-50}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
+TEST_BATCH_INTERVAL="${TEST_BATCH_INTERVAL:-20000}"
+VAL_BATCH_INTERVAL="${VAL_BATCH_INTERVAL:-0}"
+VAL_EPOCH_INTERVAL="${VAL_EPOCH_INTERVAL:-10}"
 MAX_LR="${MAX_LR:-5e-5}"
 MIN_LR="${MIN_LR:-5e-6}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
@@ -86,11 +90,13 @@ FMM_KAPPA_MAX="${FMM_KAPPA_MAX:-1.2}"
 FMM_NUM_DIRECTIONS="${FMM_NUM_DIRECTIONS:-16}"
 FMM_COMPUTE_DTYPE="${FMM_COMPUTE_DTYPE:-bf16}" # auto|fp32|bf16|fp16
 FMM_KAPPA_CHUNK_SIZE="${FMM_KAPPA_CHUNK_SIZE:-0}"
-FMM_VALUE_HEAD_DIM="${FMM_VALUE_HEAD_DIM:-0}" # 0=disable; e.g. 8 or 16 to shrink V_dim
+FMM_VALUE_HEAD_DIM="${FMM_VALUE_HEAD_DIM:-8}" # 0=disable; e.g. 8 or 16 to shrink V_dim
 FMM_LEARNABLE_RADIAL_COEFFS="${FMM_LEARNABLE_RADIAL_COEFFS:-true}"
 FMM_RADIAL_COEFFS_MODE="${FMM_RADIAL_COEFFS_MODE:-per_l_head}" # per_l_head|per_l_shared|head|shared
 FMM_RADIAL_INIT_SCALE="${FMM_RADIAL_INIT_SCALE:-0.05}"
 FMM_RADIAL_LOW_KAPPA_BIAS="${FMM_RADIAL_LOW_KAPPA_BIAS:-2.0}"
+FMM_COUPLING_NORM="${FMM_COUPLING_NORM:-sqrt}" # count|sqrt|none
+HYBRID_LONG_SCALE_INIT="${HYBRID_LONG_SCALE_INIT:-1.0}"
 
 LOADCHECK_PATH="${LOADCHECK_PATH:-}"
 
@@ -136,9 +142,11 @@ echo "Save dir: ${SAVE_DIR}"
 echo "Serial schedule: ${SERIAL_ATTN_TYPE} (num_layers=${NUM_LAYERS})"
 echo "Local cutoff: r=${MAX_RADIUS} max_neighbors=${MAX_NEIGHBORS}"
 echo "FMM: nk=${FMM_NUM_KAPPA} kappa=[${FMM_KAPPA_MIN},${FMM_KAPPA_MAX}] dirs=${FMM_NUM_DIRECTIONS} dtype=${FMM_COMPUTE_DTYPE} v_head_dim=${FMM_VALUE_HEAD_DIM}"
-echo "FMM radial: learnable=${FMM_LEARNABLE_RADIAL_COEFFS} mode=${FMM_RADIAL_COEFFS_MODE} init_scale=${FMM_RADIAL_INIT_SCALE} low_kappa_bias=${FMM_RADIAL_LOW_KAPPA_BIAS}"
+echo "FMM radial: learnable=${FMM_LEARNABLE_RADIAL_COEFFS} mode=${FMM_RADIAL_COEFFS_MODE} init_scale=${FMM_RADIAL_INIT_SCALE} low_kappa_bias=${FMM_RADIAL_LOW_KAPPA_BIAS} coupling_norm=${FMM_COUPLING_NORM}"
+echo "Hybrid long branch: hybrid_long_scale_init=${HYBRID_LONG_SCALE_INIT}"
 echo "DDP: nnodes=${NNODES} node_rank=${NODE_RANK} gpus_per_node=${GPUS_PER_NODE} world_size=${WORLD_SIZE}"
 echo "Batch: per_gpu=${PER_GPU_BATCH} grad_accum=${GRAD_ACCUM} train_batch_size(global)=${TRAIN_BATCH_SIZE}"
+echo "Eval: test_batch_interval=${TEST_BATCH_INTERVAL} val_batch_interval=${VAL_BATCH_INTERVAL} val_epoch_interval=${VAL_EPOCH_INTERVAL} save_epoch_interval=${SAVE_EPOCH_INTERVAL}"
 
 if [[ "${RUN_FMM_VBOTTLENECK_BENCH}" == "1" ]]; then
   echo
@@ -213,6 +221,8 @@ python -m torch.distributed.run \
   backbone_config.fmm_radial_coeffs_mode="${FMM_RADIAL_COEFFS_MODE}" \
   backbone_config.fmm_radial_init_scale="${FMM_RADIAL_INIT_SCALE}" \
   backbone_config.fmm_radial_low_kappa_bias="${FMM_RADIAL_LOW_KAPPA_BIAS}" \
+  backbone_config.fmm_coupling_norm="${FMM_COUPLING_NORM}" \
+  backbone_config.hybrid_long_scale_init="${HYBRID_LONG_SCALE_INIT}" \
   max_lr="${MAX_LR}" \
   min_lr="${MIN_LR}" \
   warmup_num_steps="${WARMUP_STEPS}" \
@@ -225,6 +235,10 @@ python -m torch.distributed.run \
   dataset_micro_batch_size=1 \
   shuffle=True \
   use_unified_batch_sampler=False \
+  test_batch_interval="${TEST_BATCH_INTERVAL}" \
+  val_batch_interval="${VAL_BATCH_INTERVAL}" \
+  val_epoch_interval="${VAL_EPOCH_INTERVAL}" \
+  save_epoch_interval="${SAVE_EPOCH_INTERVAL}" \
   total_num_steps="${TOTAL_NUM_STEPS}" \
   total_num_epochs="${TOTAL_NUM_EPOCHS}" \
   train_batch_size="${TRAIN_BATCH_SIZE}" \

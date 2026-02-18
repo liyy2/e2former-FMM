@@ -28,6 +28,7 @@ class RunConfig:
     val_batch_log_interval: int = 1000
     val_batch_log_all_metric: bool = False
     val_epoch_interval: int = 1
+    test_batch_interval: int = 20000
     use_unified_batch_sampler: bool = False
     gradient_clipping: float = 1.0
 
@@ -46,6 +47,7 @@ class RunConfig:
     load_ckpt: bool = False
 
     # optimizer hyperparameters
+    optimizer_name: str = "adamw"  # adamw | muon
     max_lr: float = 0.0001
     init_lr: float = 8e-5
     min_lr: float = 8e-6
@@ -53,6 +55,10 @@ class RunConfig:
     beta1: float = 0.9  # Adam
     beta2: float = 0.999  # Adam
     eps: float = 1e-8  # Adam
+    muon_beta: float = 0.95
+    muon_ns_steps: int = 5
+    muon_ns_eps: float = 1e-7
+    muon_nesterov: bool = True
 
     # lr scheduler hyperparameters
     warmup_num_steps: int = 60

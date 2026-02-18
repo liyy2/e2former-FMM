@@ -276,7 +276,7 @@ class TrainingLoop(object):
 
         self.accelerator = self.build_accelerator(loss_log_dict=loss_log_dict)
         self.accelerator.set_up()
-        self.accelerator.build_data_loader(train_data, valid_data)
+        self.accelerator.build_data_loader(train_data, valid_data, test_data)
 
         self.state = RunState(args=args)
 
@@ -436,6 +436,13 @@ class TrainingLoop(object):
             and (self.state.epoch + 1) % self.args.val_epoch_interval == 0
         )
 
+    def should_do_batch_test(self) -> bool:
+        return (
+            self.args.test_batch_interval > 0
+            and self.test_data_loader is not None
+            and self.state.global_step % self.args.test_batch_interval == 0
+        )
+
     @property
     def train_data_loader(self) -> DataLoader:
         """
@@ -450,6 +457,10 @@ class TrainingLoop(object):
     @property
     def valid_data_loader(self) -> DataLoader:
         return self.accelerator.valid_data_loader
+
+    @property
+    def test_data_loader(self) -> DataLoader:
+        return self.accelerator.test_data_loader
 
     def count_parameters(self):
         # if self.args.strategy in [
@@ -533,6 +544,9 @@ class TrainingLoop(object):
 
                         if self.should_do_batch_validate() and not self.args.profiling:
                             self.validate()
+
+                        if self.should_do_batch_test() and not self.args.profiling:
+                            self.test()
 
                         if self.should_log():
                             log_output = self.build_log_output(
@@ -632,16 +646,14 @@ class TrainingLoop(object):
 
         logger.info("Finished Training")
 
-    def validate(self):
-        """
-        Validate the model on the validation data loader.
-        """
-        if self.valid_data_loader is None:
-            logger.warning("No validation data, skip validation")
+    def _evaluate(self, data_loader: Optional[DataLoader], split: str):
+        if data_loader is None:
+            logger.warning("No {} data, skip {}.", split, split)
             return
 
         logger.info(
-            "Start validation for epoch: {}, global step: {}",
+            "Start {} for epoch: {}, global step: {}",
+            split,
             self.state.epoch,
             self.state.global_step,
         )
@@ -656,7 +668,7 @@ class TrainingLoop(object):
                 self.accelerator.world_size,
             )
 
-        for idx, batch_data in enumerate(self.valid_data_loader):
+        for idx, batch_data in enumerate(data_loader):
             if self.args.AutoGradForce is True:
                 output = self.accelerator.valid_step(batch_data, epoch=self.state.epoch)
             elif self.args.AutoGradForce is False:
@@ -679,16 +691,17 @@ class TrainingLoop(object):
 
             if (idx + 1) % self.args.val_batch_log_interval == 0:
                 logger.info(
-                    "Validtion batch: {} / {}, loss: {}",
+                    "{} batch: {} / {}, loss: {}",
+                    split,
                     idx + 1,
-                    len(self.valid_data_loader),
+                    len(data_loader),
                     output.valid_loss,
                 )
                 if self.args.val_batch_log_all_metric:
                     interval_loss_accumulator_for_log = deepcopy(
                         interval_loss_accumulator
                     )
-                    valid_log = ValidationLog(
+                    eval_log = ValidationLog(
                         valid_loss=output.valid_loss,
                         num_examples=output.num_examples,
                         epoch=self.state.epoch,
@@ -698,10 +711,9 @@ class TrainingLoop(object):
                         },
                     )
                     metric_logger.log(
-                        valid_log, "valid", self.state.global_step, log_wandb=False
+                        eval_log, split, self.state.global_step, log_wandb=False
                     )
 
-        # DDP and Zero need to sync loss and num_examples at validation
         total_loss, num_examples = self.accelerator.sync_valid_loss(
             loss_accumulator.sum, loss_accumulator.num_examples
         )
@@ -720,14 +732,26 @@ class TrainingLoop(object):
         else:
             valid_loss = 0
 
-        valid_log = ValidationLog(
+        eval_log = ValidationLog(
             valid_loss=valid_loss,
             num_examples=num_examples,
             epoch=self.state.epoch,
             extra_output={**interval_loss_accumulator.averge_log, **metric_results},
         )
-        metric_logger.log(valid_log, "valid", self.state.global_step)
-        return valid_log
+        metric_logger.log(eval_log, split, self.state.global_step)
+        return eval_log
+
+    def validate(self):
+        """
+        Validate the model on the validation data loader.
+        """
+        return self._evaluate(self.valid_data_loader, "valid")
+
+    def test(self):
+        """
+        Evaluate the model on the test data loader.
+        """
+        return self._evaluate(self.test_data_loader, "test")
 
     def _save_rng_and_iter_state(self, checkpoint):
         """

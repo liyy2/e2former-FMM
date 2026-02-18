@@ -106,7 +106,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fmm-kappa-chunk-size",
         type=int,
-        default=0,
+        default=8,
         help="Kappa chunk size for the FMM core. 0=auto, smaller can reduce peak memory.",
     )
     parser.add_argument(
@@ -119,11 +119,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fmm-value-head-dim",
         type=int,
-        default=0,
+        default=8,
         help=(
             "Optional per-head value bottleneck for fmm-node attention. "
             "0 disables; e.g. 8 or 16 reduces V_dim inside FMM."
         ),
+    )
+    parser.add_argument(
+        "--fmm-coupling-norm",
+        type=str,
+        default="sqrt",
+        choices=["count", "sqrt", "none"],
+        help="Coupling-path normalization for FMM TP aggregation.",
     )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=8)
@@ -236,6 +243,7 @@ def main() -> None:
         fmm_kappa_chunk_size=args.fmm_kappa_chunk_size,
         fmm_compute_dtype=args.fmm_compute_dtype,
         fmm_value_head_dim=args.fmm_value_head_dim,
+        fmm_coupling_norm=args.fmm_coupling_norm,
         **common,
     ).to(device)
 
@@ -253,7 +261,8 @@ def main() -> None:
         f"fmm_tp_backend={args.fmm_tp_backend} "
         f"fmm_num_kappa={args.fmm_num_kappa} kappa=[{args.fmm_kappa_min},{args.fmm_kappa_max}] "
         f"fmm_num_directions={args.fmm_num_directions} fmm_compute_dtype={args.fmm_compute_dtype} "
-        f"fmm_value_head_dim={args.fmm_value_head_dim}"
+        f"fmm_value_head_dim={args.fmm_value_head_dim} "
+        f"fmm_coupling_norm={args.fmm_coupling_norm}"
     )
     print(f"baseline(edge) forward: {t_baseline * 1e3:.3f} ms")
     print(f"fmm-node forward:       {t_fmm_node * 1e3:.3f} ms")
@@ -270,6 +279,7 @@ def main() -> None:
             fmm_kappa_chunk_size=args.fmm_kappa_chunk_size,
             fmm_compute_dtype=args.fmm_compute_dtype,
             fmm_value_head_dim=args.fmm_value_head_dim,
+            fmm_coupling_norm=args.fmm_coupling_norm,
             **common,
         ).to(device)
         t_hybrid = _time_forward(
@@ -303,6 +313,7 @@ def main() -> None:
             fmm_kappa_chunk_size=args.fmm_kappa_chunk_size,
             fmm_compute_dtype=args.fmm_compute_dtype,
             fmm_value_head_dim=args.fmm_value_head_dim,
+            fmm_coupling_norm=args.fmm_coupling_norm,
             **common,
         ).to(device)
         t_serial = _time_forward(

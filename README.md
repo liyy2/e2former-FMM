@@ -85,6 +85,15 @@ and can be overridden via environment variables.
 optimizer schedule, and E2Former backbone parameters. You can override values by exporting
 environment variables before invoking the script.
 
+Optimizer options:
+
+- Default remains `optimizer_name=adamw`.
+- Set `optimizer_name=muon` to enable hybrid Muon/AdamW:
+  Muon is applied only to hidden-layer 2D matrices matching
+  `decoder.decoder.blocks.*` + `*.weight`, while all other parameters stay on AdamW.
+- Muon knobs in `config_file/config_molfm.yaml`:
+  `muon_beta`, `muon_ns_steps`, `muon_ns_eps`, `muon_nesterov`.
+
 Node-only FMM variant:
 
 - Use `config_file/backbone_config/e2former_fmm.yaml` as the Hydra backbone config.
@@ -98,6 +107,9 @@ Node-only FMM variant:
 - Radial-mixture learning knobs:
   `fmm_learnable_radial_coeffs`, `fmm_radial_coeffs_mode`,
   `fmm_radial_init_scale`, `fmm_radial_low_kappa_bias`.
+- Coupling-path normalization knob:
+  `fmm_coupling_norm` (`count|sqrt|none`). Default is `sqrt` to match original
+  E2Former-style path scaling more closely.
 
 Hybrid short+long variant:
 
@@ -121,6 +133,10 @@ MD22 baseline vs baseline+FFM protocol:
   `Ac_Ala3_NHMe=6000`, `buckyball_catcher=600`,
   `double_walled_nanotube=800`, `chig=8000`.
 - Override with `md22_sample_size=<int>` if needed.
+- Periodic test-set evaluation during training is supported with
+  `test_batch_interval` (in optimizer steps). For long DWNT runs, use a large
+  value (for example `20000`) and disable validation intervals when desired:
+  `val_batch_interval=0`, `val_epoch_interval=0`.
 
 Example:
 

@@ -810,11 +810,12 @@ class E2AttentionHybridShortLong(torch.nn.Module):
         fmm_num_directions: int = 25,
         fmm_kappa_chunk_size: int = 0,
         fmm_compute_dtype: str | None = "auto",
-        fmm_value_head_dim: int = 0,
+        fmm_value_head_dim: int = 8,
         fmm_learnable_radial_coeffs: bool = True,
         fmm_radial_coeffs_mode: str = "per_l_head",
         fmm_radial_init_scale: float = 0.05,
         fmm_radial_low_kappa_bias: float = 2.0,
+        fmm_coupling_norm: str = "sqrt",
         hybrid_long_scale_init: float = 1.0,
         **kwargs,
     ):
@@ -875,6 +876,7 @@ class E2AttentionHybridShortLong(torch.nn.Module):
             fmm_radial_coeffs_mode=fmm_radial_coeffs_mode,
             fmm_radial_init_scale=fmm_radial_init_scale,
             fmm_radial_low_kappa_bias=fmm_radial_low_kappa_bias,
+            fmm_coupling_norm=fmm_coupling_norm,
             **kwargs,
         )
         self.long_scale = nn.Parameter(
@@ -1074,11 +1076,12 @@ class TransBlock(torch.nn.Module):
         fmm_num_directions: int = 25,
         fmm_kappa_chunk_size: int = 0,
         fmm_compute_dtype: str | None = "auto",
-        fmm_value_head_dim: int = 0,
+        fmm_value_head_dim: int = 8,
         fmm_learnable_radial_coeffs: bool = True,
         fmm_radial_coeffs_mode: str = "per_l_head",
         fmm_radial_init_scale: float = 0.05,
         fmm_radial_low_kappa_bias: float = 2.0,
+        fmm_coupling_norm: str = "sqrt",
         hybrid_long_scale_init: float = 1.0,
     ):
         super().__init__()
@@ -1182,6 +1185,7 @@ class TransBlock(torch.nn.Module):
             fmm_radial_coeffs_mode=fmm_radial_coeffs_mode,
             fmm_radial_init_scale=fmm_radial_init_scale,
             fmm_radial_low_kappa_bias=fmm_radial_low_kappa_bias,
+            fmm_coupling_norm=fmm_coupling_norm,
             hybrid_long_scale_init=hybrid_long_scale_init,
         )
 
@@ -3087,11 +3091,12 @@ class E2former(torch.nn.Module):
         self.fmm_num_directions = int(kwargs.pop("fmm_num_directions", 25))
         self.fmm_kappa_chunk_size = int(kwargs.pop("fmm_kappa_chunk_size", 0))
         self.fmm_compute_dtype = kwargs.pop("fmm_compute_dtype", "auto")
-        self.fmm_value_head_dim = int(kwargs.pop("fmm_value_head_dim", 0))
+        self.fmm_value_head_dim = int(kwargs.pop("fmm_value_head_dim", 8))
         self.fmm_learnable_radial_coeffs = bool(kwargs.pop("fmm_learnable_radial_coeffs", True))
         self.fmm_radial_coeffs_mode = str(kwargs.pop("fmm_radial_coeffs_mode", "per_l_head"))
         self.fmm_radial_init_scale = float(kwargs.pop("fmm_radial_init_scale", 0.05))
         self.fmm_radial_low_kappa_bias = float(kwargs.pop("fmm_radial_low_kappa_bias", 2.0))
+        self.fmm_coupling_norm = str(kwargs.pop("fmm_coupling_norm", "sqrt"))
         self.hybrid_long_scale_init = float(kwargs.pop("hybrid_long_scale_init", 1.0))
         if self.node_only_attention and self.decouple_EF:
             raise ValueError(
@@ -3199,6 +3204,7 @@ class E2former(torch.nn.Module):
                 fmm_radial_coeffs_mode=self.fmm_radial_coeffs_mode,
                 fmm_radial_init_scale=self.fmm_radial_init_scale,
                 fmm_radial_low_kappa_bias=self.fmm_radial_low_kappa_bias,
+                fmm_coupling_norm=self.fmm_coupling_norm,
                 hybrid_long_scale_init=self.hybrid_long_scale_init,
             )
             self.blocks.append(blk)
@@ -3236,6 +3242,7 @@ class E2former(torch.nn.Module):
                 fmm_radial_coeffs_mode=self.fmm_radial_coeffs_mode,
                 fmm_radial_init_scale=self.fmm_radial_init_scale,
                 fmm_radial_low_kappa_bias=self.fmm_radial_low_kappa_bias,
+                fmm_coupling_norm=self.fmm_coupling_norm,
                 hybrid_long_scale_init=self.hybrid_long_scale_init,
             )
 

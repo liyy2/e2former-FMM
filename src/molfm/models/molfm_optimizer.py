@@ -305,7 +305,183 @@ if USE_APEX_FUSED_ADAM:
                                 device=p.device
                             )
 
-else:
+
+def _newton_schulz_orthogonalize(
+    matrix: torch.Tensor, num_steps: int = 5, eps: float = 1e-7
+) -> torch.Tensor:
+    """
+    Orthogonalize a 2D update matrix using Newton-Schulz iterations.
+    This is the core transform used by Muon.
+    """
+    if matrix.ndim != 2:
+        raise ValueError(
+            f"Muon update expects 2D matrices, but got ndim={matrix.ndim}."
+        )
+
+    x = matrix.float()
+    transposed = False
+    if x.shape[0] > x.shape[1]:
+        x = x.t()
+        transposed = True
+
+    # Normalize before Newton-Schulz to improve numerical stability.
+    x = x / (x.norm() + eps)
+
+    a, b, c = 3.4445, -4.7750, 2.0315
+    for _ in range(num_steps):
+        a_mat = x @ x.t()
+        x = a * x + (b * a_mat + c * (a_mat @ a_mat)) @ x
+
+    if transposed:
+        x = x.t()
+    return x
+
+
+class MuonAdamW(Optimizer):
+    """
+    Hybrid optimizer: Muon for selected param groups and AdamW for the rest.
+
+    Each parameter group can set `optim_type` to:
+      - "muon": Muon update (expects 2D tensors)
+      - "adamw": classic AdamW update
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+        muon_beta: float = 0.95,
+        muon_ns_steps: int = 5,
+        muon_ns_eps: float = 1e-7,
+        muon_nesterov: bool = True,
+    ):
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            muon_beta=muon_beta,
+            muon_ns_steps=muon_ns_steps,
+            muon_ns_eps=muon_ns_eps,
+            muon_nesterov=muon_nesterov,
+            optim_type="adamw",
+        )
+        super().__init__(params, defaults)
+
+    @staticmethod
+    def _to_float(value):
+        if isinstance(value, torch.Tensor):
+            return float(value.item())
+        return float(value)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            optim_type = group.get("optim_type", "adamw")
+            if optim_type == "muon":
+                self._step_muon(group)
+            elif optim_type == "adamw":
+                self._step_adamw(group)
+            else:
+                raise ValueError(f"Unknown optim_type={optim_type}")
+
+        return loss
+
+    def _step_muon(self, group):
+        lr = self._to_float(group["lr"])
+        weight_decay = self._to_float(group["weight_decay"])
+        beta = self._to_float(group["muon_beta"])
+        ns_steps = int(group["muon_ns_steps"])
+        ns_eps = self._to_float(group["muon_ns_eps"])
+        nesterov = bool(group["muon_nesterov"])
+
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            if p.grad.is_sparse:
+                raise RuntimeError("Muon does not support sparse gradients.")
+
+            grad = p.grad.detach()
+            if grad.ndim != 2:
+                # Muon should only target 2D weights; silently skip any mismatch.
+                continue
+
+            state = self.state[p]
+            if len(state) == 0:
+                state["momentum_buffer"] = torch.zeros_like(
+                    p, memory_format=torch.preserve_format, dtype=torch.float
+                )
+
+            momentum = state["momentum_buffer"]
+            grad_fp32 = grad.float()
+            momentum.mul_(beta).add_(grad_fp32, alpha=1.0 - beta)
+
+            if nesterov:
+                update = beta * momentum + (1.0 - beta) * grad_fp32
+            else:
+                update = momentum
+
+            update = _newton_schulz_orthogonalize(
+                update, num_steps=ns_steps, eps=ns_eps
+            )
+
+            if weight_decay != 0.0:
+                p.mul_(1.0 - lr * weight_decay)
+            p.add_(update.to(dtype=p.dtype), alpha=-lr)
+
+    def _step_adamw(self, group):
+        lr = self._to_float(group["lr"])
+        weight_decay = self._to_float(group["weight_decay"])
+        beta1, beta2 = group["betas"]
+        beta1 = self._to_float(beta1)
+        beta2 = self._to_float(beta2)
+        eps = self._to_float(group["eps"])
+
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            if p.grad.is_sparse:
+                raise RuntimeError("AdamW does not support sparse gradients.")
+
+            grad_fp32 = p.grad.detach().float()
+
+            state = self.state[p]
+            if len(state) == 0:
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(
+                    p, memory_format=torch.preserve_format, dtype=torch.float
+                )
+                state["exp_avg_sq"] = torch.zeros_like(
+                    p, memory_format=torch.preserve_format, dtype=torch.float
+                )
+
+            exp_avg = state["exp_avg"]
+            exp_avg_sq = state["exp_avg_sq"]
+            state["step"] += 1
+            step = state["step"]
+
+            exp_avg.mul_(beta1).add_(grad_fp32, alpha=1.0 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(grad_fp32, grad_fp32, value=1.0 - beta2)
+
+            bias_correction1 = 1.0 - beta1**step
+            bias_correction2 = 1.0 - beta2**step
+
+            denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
+            step_size = lr / bias_correction1
+
+            if weight_decay != 0.0:
+                p.mul_(1.0 - lr * weight_decay)
+            p.add_((exp_avg / denom).to(dtype=p.dtype), alpha=-step_size)
+
+if not USE_APEX_FUSED_ADAM:
 
     class AdamFP16(AdamW):
         def __init__(

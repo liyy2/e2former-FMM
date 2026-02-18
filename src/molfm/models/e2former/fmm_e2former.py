@@ -114,6 +114,9 @@ class E2AttentionNodeFMM(nn.Module):
             "per_l_head" | "per_l_shared" | "head" | "shared".
         fmm_radial_init_scale: Initial coefficient scale (small values are safer).
         fmm_radial_low_kappa_bias: Exponential low-frequency preference at init.
+        fmm_coupling_norm: Coupling-path normalization after CG aggregation:
+            "count" (divide by #paths), "sqrt" (divide by sqrt(#paths)),
+            or "none" (no extra divide).
         (all other kwargs are accepted for interface compatibility but discarded)
     """
 
@@ -142,11 +145,12 @@ class E2AttentionNodeFMM(nn.Module):
         fmm_num_directions: int = 25,
         fmm_kappa_chunk_size: int = 0,
         fmm_compute_dtype: str | None = "auto",
-        fmm_value_head_dim: int = 0,
+        fmm_value_head_dim: int = 8,
         fmm_learnable_radial_coeffs: bool = True,
         fmm_radial_coeffs_mode: str = "per_l_head",
         fmm_radial_init_scale: float = 0.05,
         fmm_radial_low_kappa_bias: float = 2.0,
+        fmm_coupling_norm: str = "sqrt",
         **kwargs,
     ):
         super().__init__()
@@ -267,6 +271,9 @@ class E2AttentionNodeFMM(nn.Module):
                 "fmm_radial_low_kappa_bias must be >= 0, got "
                 f"{fmm_radial_low_kappa_bias}"
             )
+        self.fmm_coupling_norm = self._normalize_coupling_norm_mode(
+            fmm_coupling_norm
+        )
         # Radial basis: f_l(r) = sum_q a_q * j_l(kappa_q * r)
         # The compact default band (1.0..1.4) significantly reduces directional
         # quadrature aliasing (better equivariance) while keeping compute cost unchanged.
@@ -419,7 +426,7 @@ class E2AttentionNodeFMM(nn.Module):
         for out_idx, (mul, ir) in enumerate(tp_all.irreps_out):
             dim = int(mul * ir.dim)
             # Remove the e3nn path weight from the precomputed matrix so we
-            # control normalization ourselves (divide by coupling_count later).
+            # control normalization ourselves (via fmm_coupling_norm later).
             right_all[:, :, offset : offset + dim].div_(path_weight[out_idx])
             out_l = int(ir.l)
             if out_l <= self.lmax:
@@ -449,9 +456,19 @@ class E2AttentionNodeFMM(nn.Module):
         self.register_buffer("tp_right_flat_all", tp_right_flat_all.contiguous())
 
         # coupling_count[L] = number of (ell, lambda) paths that produce degree L.
-        # Used to average (not just sum) contributions in forward, preventing
-        # higher-connectivity degrees from having disproportionately large outputs.
-        self.register_buffer("coupling_count", coupling_count.clamp_min(1.0))
+        # coupling_norm[L] is derived from fmm_coupling_norm:
+        #   - "count": divide by count
+        #   - "sqrt":  divide by sqrt(count)
+        #   - "none":  divide by 1
+        coupling_count = coupling_count.clamp_min(1.0)
+        if self.fmm_coupling_norm == "count":
+            coupling_norm = coupling_count.clone()
+        elif self.fmm_coupling_norm == "sqrt":
+            coupling_norm = coupling_count.sqrt()
+        else:
+            coupling_norm = torch.ones_like(coupling_count)
+        self.register_buffer("coupling_count", coupling_count)
+        self.register_buffer("coupling_norm", coupling_norm)
 
     # =================================================================
     # Helper methods
@@ -616,6 +633,30 @@ class E2AttentionNodeFMM(nn.Module):
         if "tp_cueq" in tags or "cueq_tp" in tags:
             return "cueq"
         return "auto"
+
+    @staticmethod
+    def _normalize_coupling_norm_mode(mode: str | None) -> str:
+        """Normalize user-facing coupling normalization mode to a canonical token."""
+        token = "sqrt" if mode is None else str(mode).strip().lower()
+        alias = {
+            "count": "count",
+            "avg": "count",
+            "mean": "count",
+            "average": "count",
+            "sqrt": "sqrt",
+            "sqrt_count": "sqrt",
+            "sqrt_mean": "sqrt",
+            "none": "none",
+            "off": "none",
+            "disable": "none",
+        }
+        if token not in alias:
+            raise ValueError(
+                "fmm_coupling_norm must be one of "
+                "{'count','sqrt','none'} (aliases: avg/mean, sqrt_count, off), "
+                f"got {mode!r}."
+            )
+        return alias[token]
 
     @staticmethod
     def _build_initial_radial_coeffs(
@@ -815,14 +856,12 @@ class E2AttentionNodeFMM(nn.Module):
         # =====================================================================
         # Step 3: Q/K projections (irreps -> scalar per head)
         # =====================================================================
-        # Project in fp32 for numerical stability (SO3_Linear2Scalar involves
-        # degree-wise inner products that are sensitive to precision).
+        # Keep incoming dtype so AMP/autocast can choose precision policy.
         # packed_irreps: (B, max_nodes, (lmax+1)^2, C) -> q,k: (B, max_nodes, H, d)
-        packed_irreps_f = packed_irreps.to(dtype=torch.float32)
-        q = self.q_proj(packed_irreps_f).view(
+        q = self.q_proj(packed_irreps).view(
             num_graphs, max_nodes, self.num_attn_heads, self.attn_scalar_head
         )
-        k = self.k_proj(packed_irreps_f).view(
+        k = self.k_proj(packed_irreps).view(
             num_graphs, max_nodes, self.num_attn_heads, self.attn_scalar_head
         )
 
@@ -999,14 +1038,14 @@ class E2AttentionNodeFMM(nn.Module):
             packed_out[:, :, out_start:out_end, :].add_(block)
 
         # =====================================================================
-        # Step 8: Normalize by the number of coupling paths
+        # Step 8: Normalize by configured coupling-path factor
         # =====================================================================
         # Each output degree L receives contributions from coupling_count[L]
-        # different (ell, lambda) paths. We average (not just sum) to keep the
-        # output scale independent of how many CG paths exist for each L.
+        # different (ell, lambda) paths. Scale each degree by coupling_norm[L],
+        # where coupling_norm is selected by fmm_coupling_norm.
         for out_l in range(self.lmax + 1):
             out_start, out_end = self._l_slice(out_l)
-            packed_out[:, :, out_start:out_end, :].div_(self.coupling_count[out_l])
+            packed_out[:, :, out_start:out_end, :].div_(self.coupling_norm[out_l])
 
         if self.out_proj is not None:
             packed_out = self.out_proj(packed_out)
