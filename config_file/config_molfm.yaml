@@ -59,6 +59,7 @@ muon_beta: 0.95
 muon_ns_steps: 5
 muon_ns_eps: 1e-7
 muon_nesterov: True
+muon_use_tp_flattened: False
 
 data_path: ""
 data_path_list: ""

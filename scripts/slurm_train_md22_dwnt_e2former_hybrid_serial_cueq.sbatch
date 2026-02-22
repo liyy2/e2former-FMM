@@ -72,6 +72,12 @@ MAX_LR="${MAX_LR:-5e-5}"
 MIN_LR="${MIN_LR:-5e-6}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-5e-3}"
+OPTIMIZER_NAME="${OPTIMIZER_NAME:-adamw}" # adamw|muon
+MUON_USE_TP_FLATTENED="${MUON_USE_TP_FLATTENED:-false}" # true|false
+MUON_BETA="${MUON_BETA:-0.95}"
+MUON_NS_STEPS="${MUON_NS_STEPS:-5}"
+MUON_NS_EPS="${MUON_NS_EPS:-1e-7}"
+MUON_NESTEROV="${MUON_NESTEROV:-true}"
 SEED="${SEED:-48}"
 
 NUM_LAYERS="${NUM_LAYERS:-8}"
@@ -144,6 +150,7 @@ echo "Local cutoff: r=${MAX_RADIUS} max_neighbors=${MAX_NEIGHBORS}"
 echo "FMM: nk=${FMM_NUM_KAPPA} kappa=[${FMM_KAPPA_MIN},${FMM_KAPPA_MAX}] dirs=${FMM_NUM_DIRECTIONS} dtype=${FMM_COMPUTE_DTYPE} v_head_dim=${FMM_VALUE_HEAD_DIM}"
 echo "FMM radial: learnable=${FMM_LEARNABLE_RADIAL_COEFFS} mode=${FMM_RADIAL_COEFFS_MODE} init_scale=${FMM_RADIAL_INIT_SCALE} low_kappa_bias=${FMM_RADIAL_LOW_KAPPA_BIAS} coupling_norm=${FMM_COUPLING_NORM}"
 echo "Hybrid long branch: hybrid_long_scale_init=${HYBRID_LONG_SCALE_INIT}"
+echo "Optimizer: ${OPTIMIZER_NAME} (muon_use_tp_flattened=${MUON_USE_TP_FLATTENED})"
 echo "DDP: nnodes=${NNODES} node_rank=${NODE_RANK} gpus_per_node=${GPUS_PER_NODE} world_size=${WORLD_SIZE}"
 echo "Batch: per_gpu=${PER_GPU_BATCH} grad_accum=${GRAD_ACCUM} train_batch_size(global)=${TRAIN_BATCH_SIZE}"
 echo "Eval: test_batch_interval=${TEST_BATCH_INTERVAL} val_batch_interval=${VAL_BATCH_INTERVAL} val_epoch_interval=${VAL_EPOCH_INTERVAL} save_epoch_interval=${SAVE_EPOCH_INTERVAL}"
@@ -227,6 +234,12 @@ python -m torch.distributed.run \
   min_lr="${MIN_LR}" \
   warmup_num_steps="${WARMUP_STEPS}" \
   weight_decay="${WEIGHT_DECAY}" \
+  optimizer_name="${OPTIMIZER_NAME}" \
+  muon_use_tp_flattened="${MUON_USE_TP_FLATTENED}" \
+  muon_beta="${MUON_BETA}" \
+  muon_ns_steps="${MUON_NS_STEPS}" \
+  muon_ns_eps="${MUON_NS_EPS}" \
+  muon_nesterov="${MUON_NESTEROV}" \
   data_path="${DATA_DIR}" \
   data_path_list="${DATA_FILE}" \
   dataset_name_list="${DATASET_NAME}" \

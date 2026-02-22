@@ -2,6 +2,7 @@
 """This script is used to fine-tune the molfm model on small molecules dataset, such MD17, MD22, PubChem50K, etc."""
 import os
 import sys
+import math
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
@@ -108,11 +109,65 @@ def _is_muon_hidden_2d_weight(name: str, param: torch.nn.Parameter) -> bool:
     )
 
 
-def _build_muon_param_groups(model: nn.Module):
+def _collect_muon_tp_block_layouts(
+    model: nn.Module,
+) -> tuple[dict[torch.nn.Parameter, list[tuple[int, int, int, int]]], list[str]]:
+    """
+    Collect per-parameter block layouts for flattened TP weights.
+
+    Returns:
+      - mapping: p -> [(start, numel, rows, cols), ...]
+      - names: fully-qualified parameter names for those flattened TP weights
+    """
+    layouts: dict[torch.nn.Parameter, list[tuple[int, int, int, int]]] = {}
+    names: list[str] = []
+
+    for module_name, module in model.named_modules():
+        weight = getattr(module, "weight", None)
+        instructions = getattr(module, "instructions", None)
+        if not isinstance(weight, torch.nn.Parameter):
+            continue
+        if weight.ndim != 1:
+            continue
+        if instructions is None:
+            continue
+
+        blocks: list[tuple[int, int, int, int]] = []
+        offset = 0
+        for ins in instructions:
+            if not getattr(ins, "has_weight", False):
+                continue
+            path_shape = tuple(int(v) for v in ins.path_shape)
+            numel = int(math.prod(path_shape))
+            if len(path_shape) >= 2:
+                rows = int(math.prod(path_shape[:-1]))
+                cols = int(path_shape[-1])
+                if rows > 0 and cols > 0:
+                    blocks.append((offset, numel, rows, cols))
+            offset += numel
+
+        # Only accept true flattened TP weights where the weighted-path layout
+        # exactly matches the stored parameter length. Some modules expose TP
+        # instructions but replace `.weight` with a scalar proxy.
+        if blocks and offset == int(weight.numel()):
+            layouts[weight] = blocks
+            if module_name:
+                names.append(f"{module_name}.weight")
+
+    return layouts, sorted(names)
+
+
+def _build_muon_param_groups(model: nn.Module, include_tp_flattened: bool = False):
+    tp_layouts: dict[torch.nn.Parameter, list[tuple[int, int, int, int]]] = {}
+    if include_tp_flattened:
+        tp_layouts, _ = _collect_muon_tp_block_layouts(model)
+
     muon_params = []
     muon_names = []
+    muon_tp_names = []
     head_params = []
     other_params = []
+    muon_tp_block_layouts: dict[torch.nn.Parameter, list[tuple[int, int, int, int]]] = {}
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -124,9 +179,19 @@ def _build_muon_param_groups(model: nn.Module):
             or ("force_head" in name)
             or ("forces_head" in name)
         )
-        if _is_muon_hidden_2d_weight(name, param) and not is_head:
+        is_tp_flat_muon = (
+            include_tp_flattened
+            and param.ndim == 1
+            and name.endswith(".weight")
+            and name.startswith(_MUON_HIDDEN_PREFIX)
+            and param in tp_layouts
+        )
+        if (_is_muon_hidden_2d_weight(name, param) or is_tp_flat_muon) and not is_head:
             muon_params.append(param)
             muon_names.append(name)
+            if is_tp_flat_muon:
+                muon_tp_names.append(name)
+                muon_tp_block_layouts[param] = tp_layouts[param]
         elif is_head:
             head_params.append(param)
         else:
@@ -145,11 +210,14 @@ def _build_muon_param_groups(model: nn.Module):
 
     stats = {
         "muon_param_count": len(muon_params),
+        "muon_tp_param_count": len(muon_tp_names),
+        "muon_2d_param_count": len(muon_params) - len(muon_tp_names),
         "head_param_count": len(head_params),
         "other_param_count": len(other_params),
         "muon_names": muon_names,
+        "muon_tp_names": muon_tp_names,
     }
-    return param_groups, stats
+    return param_groups, stats, muon_tp_block_layouts
 
 
 def _resolve_md22_sample_size(
@@ -664,7 +732,10 @@ def finetune(cfg: DictConfig) -> None:
 
     optimizer_name = getattr(args, "optimizer_name", "adamw").lower()
     if optimizer_name == "muon":
-        param_groups, muon_stats = _build_muon_param_groups(model)
+        use_tp_flattened = bool(getattr(args, "muon_use_tp_flattened", False))
+        param_groups, muon_stats, muon_tp_block_layouts = _build_muon_param_groups(
+            model, include_tp_flattened=use_tp_flattened
+        )
         optimizer = MuonAdamW(
             param_groups,
             lr=args.max_lr,
@@ -675,21 +746,30 @@ def finetune(cfg: DictConfig) -> None:
             muon_ns_steps=getattr(args, "muon_ns_steps", 5),
             muon_ns_eps=getattr(args, "muon_ns_eps", 1e-7),
             muon_nesterov=getattr(args, "muon_nesterov", True),
+            muon_tp_block_layouts=muon_tp_block_layouts,
         )
         logger.info(
-            "Using MuonAdamW: {} hidden 2D weights (Muon), {} head params (AdamW), {} other params (AdamW).",
+            "Using MuonAdamW: {} params (Muon: {} 2D + {} flattened TP), {} head params (AdamW), {} other params (AdamW).",
             muon_stats["muon_param_count"],
+            muon_stats["muon_2d_param_count"],
+            muon_stats["muon_tp_param_count"],
             muon_stats["head_param_count"],
             muon_stats["other_param_count"],
         )
         if muon_stats["muon_param_count"] == 0:
             logger.warning(
-                "optimizer_name=muon but no parameters matched hidden 2D criterion "
-                "('{}*.weight'). Falling back effectively to AdamW groups.",
+                "optimizer_name=muon but no parameters matched Muon criteria "
+                "(hidden 2D '{}*.weight'{}). Falling back effectively to AdamW groups.",
                 _MUON_HIDDEN_PREFIX,
+                " + flattened TP weights" if use_tp_flattened else "",
             )
         else:
             logger.info("Muon parameter examples: {}", muon_stats["muon_names"][:10])
+            if muon_stats["muon_tp_param_count"] > 0:
+                logger.info(
+                    "Muon flattened TP examples: {}",
+                    muon_stats["muon_tp_names"][:10],
+                )
     else:
         # Default behavior: Adam/AdamW over all trainable params.
         optimizer = myAdam(

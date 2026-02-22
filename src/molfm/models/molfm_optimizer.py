@@ -357,6 +357,8 @@ class MuonAdamW(Optimizer):
         muon_ns_steps: int = 5,
         muon_ns_eps: float = 1e-7,
         muon_nesterov: bool = True,
+        muon_tp_block_layouts: dict[torch.nn.Parameter, list[tuple[int, int, int, int]]]
+        | None = None,
     ):
         defaults = dict(
             lr=lr,
@@ -370,6 +372,10 @@ class MuonAdamW(Optimizer):
             optim_type="adamw",
         )
         super().__init__(params, defaults)
+        # Optional map for flattened TP parameters:
+        #   p -> [(start, numel, rows, cols), ...]
+        # Each block is reshaped to (rows, cols) and receives Muon orthogonalization.
+        self._muon_tp_block_layouts = muon_tp_block_layouts or {}
 
     @staticmethod
     def _to_float(value):
@@ -410,10 +416,6 @@ class MuonAdamW(Optimizer):
                 raise RuntimeError("Muon does not support sparse gradients.")
 
             grad = p.grad.detach()
-            if grad.ndim != 2:
-                # Muon should only target 2D weights; silently skip any mismatch.
-                continue
-
             state = self.state[p]
             if len(state) == 0:
                 state["momentum_buffer"] = torch.zeros_like(
@@ -429,9 +431,25 @@ class MuonAdamW(Optimizer):
             else:
                 update = momentum
 
-            update = _newton_schulz_orthogonalize(
-                update, num_steps=ns_steps, eps=ns_eps
-            )
+            if grad.ndim == 2:
+                update = _newton_schulz_orthogonalize(
+                    update, num_steps=ns_steps, eps=ns_eps
+                )
+            elif grad.ndim == 1 and p in self._muon_tp_block_layouts:
+                # Flattened TP weights are stored as 1D vectors. Apply Muon block-wise
+                # by reshaping each weighted TP path into a matrix.
+                update_flat = update.clone()
+                for start, numel, rows, cols in self._muon_tp_block_layouts[p]:
+                    block = update.narrow(0, start, numel).view(rows, cols)
+                    block = _newton_schulz_orthogonalize(
+                        block, num_steps=ns_steps, eps=ns_eps
+                    )
+                    update_flat.narrow(0, start, numel).copy_(block.reshape(-1))
+                update = update_flat
+            else:
+                # Muon should only target 2D matrices and configured flattened TP
+                # weights. Silently skip any mismatch.
+                continue
 
             if weight_decay != 0.0:
                 p.mul_(1.0 - lr * weight_decay)

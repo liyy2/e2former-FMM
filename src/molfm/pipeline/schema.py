@@ -59,6 +59,7 @@ class RunConfig:
     muon_ns_steps: int = 5
     muon_ns_eps: float = 1e-7
     muon_nesterov: bool = True
+    muon_use_tp_flattened: bool = False
 
     # lr scheduler hyperparameters
     warmup_num_steps: int = 60

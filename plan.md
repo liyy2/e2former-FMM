@@ -707,3 +707,264 @@ source /gpfs/radev/apps/avx512/software/miniconda/24.3.0-miniforge/etc/profile.d
 conda activate /gpfs/radev/project/gerstein/yl2428/yl2428/e2former-FMM/.conda/envs/e2former-cueq
 DS_ACCELERATOR=cpu PYTHONPATH=./src python /tmp/smoke_muon_optimizer.py
 ```
+
+## Update (2026-02-18 14:10 EST) - Muon support for flattened TP kernels (optional)
+
+Added optional Muon-on-TP path without changing defaults:
+- New config knob: `muon_use_tp_flattened` (default `False`).
+- When enabled, flattened TP kernel weights are included in Muon groups if they are hidden-layer
+  `decoder.decoder.blocks.*.weight` parameters and expose TP instruction metadata.
+- `MuonAdamW` now accepts `muon_tp_block_layouts` and applies Muon block-wise:
+  each weighted TP path is reshaped to a 2D matrix `(prod(path_shape[:-1]), path_shape[-1])`,
+  orthogonalized via Newton-Schulz, then written back to the flattened vector.
+
+Validation snapshot on serial-hybrid (`first-order6+fmm-node2`, `tp_type=QK_alpha+tp_cueq`):
+- TP-name parameters: `72`
+- TP-name params matched by Muon rule: `18` (these are `rad_func_intputhead.net.*.weight`, 2D)
+- True TP core params inspected:
+  - `...first_order_tp.tensor_product_tp_component_1.weight` shape `(98304,)` (1D)
+  - `...wigner_6j_tp.weight` shape `(1,)` (1D)
+  - these are now eligible only when `muon_use_tp_flattened=True`.
+
+## Update (2026-02-18 14:21 EST) - TP Muon validation + bugfix
+
+Ran runtime validation of the new `muon_use_tp_flattened` path on serial-hybrid config.
+
+Findings:
+- Initial test exposed a bug: some TP-like modules expose `instructions` but override `.weight` with a scalar proxy (`shape=(1,)`), causing invalid block slicing.
+- Fixed in `train_molfm._collect_muon_tp_block_layouts`: now only accepts flattened TP layouts when `sum(weighted_path_numel) == weight.numel()`.
+
+Post-fix checks:
+- Grouping counts:
+  - without flattened TP: `muon_param_count=104`, `muon_tp_param_count=0`
+  - with flattened TP: `muon_param_count=110`, `muon_tp_param_count=6`
+- Verified real Muon step on flattened TP weight
+  (`decoder.decoder.blocks.0.ga.first_order_tp.tensor_product_tp_component_1.weight`, shape `(98304,)`):
+  - finite outputs: True
+  - parameter changed after step (`delta=0.6159`)
+- Final script result: `RESULT: PASS`.
+
+## Update (2026-02-18 15:07 EST) - A/B comparison for `muon_use_tp_flattened`
+
+Constraint:
+- Local node currently has a single H100 (`GPU 0`) fully occupied by active run
+  `dwnt_local_best_resume_20260218_130359`, so no fair GPU A/B was possible without interruption.
+
+Executed controlled CPU optimizer-level A/B (same initialized model, identical random gradients):
+- Config base: `e2former_hybrid`, `attn_type=first-order6+fmm-node2`, `tp_type=QK_alpha+tp_cueq`, `fmm_num_kappa=4`, `fmm_value_head_dim=8`.
+- Variant A: `muon_use_tp_flattened=False`
+- Variant B: `muon_use_tp_flattened=True`
+- Each variant: 6 optimizer steps with matched synthetic gradients.
+
+Results:
+- Muon param counts:
+  - A: `muon_param_count=104`, `muon_tp_param_count=0`
+  - B: `muon_param_count=110`, `muon_tp_param_count=6` (one flattened TP weight per local block 0..5)
+- Mean step time (CPU, optimizer step only):
+  - A: `0.754 s`
+  - B: `2.244 s`
+  - ratio B/A: `2.97x`
+- Example TP parameter update (`decoder.decoder.blocks.0.ga.first_order_tp.tensor_product_tp_component_1.weight`):
+  - A delta L2: `0.0905` (updated via AdamW path)
+  - B delta L2: `0.00982` (updated via Muon block-wise TP path)
+
+Interpretation:
+- Enabling flattened TP Muon works and is active for 6 TP weights.
+- It adds noticeable optimizer compute overhead on CPU in this synthetic-step test.
+
+## Update (2026-02-18 15:10 EST) - Full Slurm A/B launched for Muon TP
+
+Goal:
+- Run a full MD22 DWNT serial-hybrid Slurm comparison with identical settings except
+  `muon_use_tp_flattened`.
+
+Launcher changes:
+- Updated `scripts/slurm_train_md22_dwnt_e2former_hybrid_serial_cueq.sbatch` to accept:
+  - `OPTIMIZER_NAME`
+  - `MUON_USE_TP_FLATTENED`
+  - `MUON_BETA`, `MUON_NS_STEPS`, `MUON_NS_EPS`, `MUON_NESTEROV`
+- Wired these into Hydra overrides (`optimizer_name`, `muon_*`).
+
+Submitted jobs (timestamp tag `20260218_150929`):
+- `1167209` job name `dwnt_muon_notp_full`
+  - W&B run: `dwnt_muon_notp_full_20260218_150929`
+  - Muon TP setting: `MUON_USE_TP_FLATTENED=false`
+- `1167210` job name `dwnt_muon_tp_full`
+  - W&B run: `dwnt_muon_tp_full_20260218_150929`
+  - Muon TP setting: `MUON_USE_TP_FLATTENED=true`
+
+Common key overrides:
+- `OPTIMIZER_NAME=muon`
+- Serial hybrid: `attn_type=first-order6+fmm-node2`, `tp_type=QK_alpha+tp_cueq`
+- Cutoff: `MAX_RADIUS=10.0`, `PBC_MAX_RADIUS=10.0`, `MAX_NEIGHBORS=24`
+- FMM: `nk=4`, `kappa=[0.8,1.2]`, `dirs=16`, `dtype=bf16`, `v_head_dim=8`,
+  learnable radial on, `FMM_COUPLING_NORM=count`
+- Optimization: `MAX_LR=5e-5`, `MIN_LR=5e-6`, `WARMUP_STEPS=2000`, `WEIGHT_DECAY=5e-3`, `SEED=59`
+- Full-run schedule: defaults `TOTAL_NUM_STEPS=200000`, `TOTAL_NUM_EPOCHS=3000`
+- Requested resources per job: `gpu:1`, `cpus=16`, `mem=120G`, `time=47:00:00`
+- Batch consistency via accumulation: `PER_GPU_BATCH=2`, `GRAD_ACCUM=4` (global train batch stays 8)
+
+Current scheduler state right after submit:
+- `1167209`: `PENDING (Priority)`
+- `1167210`: `PENDING (Priority)`
+- (No `QOSMaxGRESPerUser` blocker for these two at submit time.)
+
+Expected logs/artifacts:
+- Slurm logs:
+  - `outputs/slurm/dwnt_muon_notp_full-1167209.out`
+  - `outputs/slurm/dwnt_muon_tp_full-1167210.out`
+- Save dirs:
+  - `outputs/runs/md22_dwnt/hybrid_serial_cueq/dwnt_muon_notp_full_20260218_150929`
+  - `outputs/runs/md22_dwnt/hybrid_serial_cueq/dwnt_muon_tp_full_20260218_150929`
+
+## Update (2026-02-18 16:41 EST) - Re-launch Muon A/B with `GRAD_ACCUM=1`
+
+Reason:
+- Prior Muon A/B (`1167209`, `1167210`) was launched with `GRAD_ACCUM=4` to keep
+  larger effective batch. For direct optimizer comparison against Adam-pure runs,
+  we switched Muon runs to `GRAD_ACCUM=1`.
+
+Actions:
+- Cancelled previous Muon jobs:
+  - `1167209` (`dwnt_muon_notp_full`) -> `CANCELLED`
+  - `1167210` (`dwnt_muon_tp_full`) -> `CANCELLED`
+- Re-submitted Muon A/B with the same architecture/hyperparameters but `GRAD_ACCUM=1`.
+
+Submitted jobs (timestamp tag `20260218_164118`):
+- `1167522` job name `dwnt_muon_notp_ga1`
+  - W&B run: `dwnt_muon_notp_ga1_20260218_164118`
+  - Muon TP setting: `MUON_USE_TP_FLATTENED=false`
+- `1167523` job name `dwnt_muon_tp_ga1`
+  - W&B run: `dwnt_muon_tp_ga1_20260218_164118`
+  - Muon TP setting: `MUON_USE_TP_FLATTENED=true`
+
+Key overrides for this relaunch:
+- `OPTIMIZER_NAME=muon`
+- Serial hybrid: `attn_type=first-order6+fmm-node2`, `tp_type=QK_alpha+tp_cueq`
+- Cutoff: `MAX_RADIUS=10.0`, `PBC_MAX_RADIUS=10.0`, `MAX_NEIGHBORS=24`
+- FMM: `nk=4`, `kappa=[0.8,1.2]`, `dirs=16`, `dtype=bf16`, `v_head_dim=8`,
+  learnable radial on, `FMM_COUPLING_NORM=count`
+- Optimization: `MAX_LR=5e-5`, `MIN_LR=5e-6`, `WARMUP_STEPS=2000`,
+  `WEIGHT_DECAY=5e-3`, `SEED=59`
+- Requested resources per job: `gpu:1`, `cpus=16`, `mem=120G`, `time=47:00:00`
+
+## Update (2026-02-18 16:46 EST) - Added Muon A/B with `PER_GPU_BATCH=8`, `GRAD_ACCUM=1`
+
+Per request, submitted an additional pair with local micro-batch increased to 8
+while keeping accumulation at 1.
+
+Submitted jobs (timestamp tag `20260218_164622`):
+- `1167534` job name `dwnt_muon_notp_b8ga1`
+  - W&B run: `dwnt_muon_notp_b8ga1_20260218_164622`
+  - Muon TP setting: `MUON_USE_TP_FLATTENED=false`
+- `1167535` job name `dwnt_muon_tp_b8ga1`
+  - W&B run: `dwnt_muon_tp_b8ga1_20260218_164622`
+  - Muon TP setting: `MUON_USE_TP_FLATTENED=true`
+
+Key batch setting for this pair:
+- `PER_GPU_BATCH=8`
+- `GRAD_ACCUM=1`
+- single GPU (`gres/gpu:1`) so effective global train batch is 8.
+
+Scheduler snapshot right after submit:
+- `1167534`: `PENDING (Priority)`
+- `1167535`: `PENDING (Priority)`
+
+## Update (2026-02-18 16:48 EST) - Removed `PER_GPU_BATCH=2` Muon pair
+
+Per request, removed the `ga1` pair from queue:
+- `1167522` (`dwnt_muon_notp_ga1`) -> `CANCELLED`
+- `1167523` (`dwnt_muon_tp_ga1`) -> `CANCELLED`
+
+Active Muon pair now:
+- `1167534` (`dwnt_muon_notp_b8ga1`)
+- `1167535` (`dwnt_muon_tp_b8ga1`)
+
+## Update (2026-02-19 12:03 EST) - `b8ga1` failure diagnosis and `b4ga2` relaunch
+
+Failure diagnosis for `PER_GPU_BATCH=8`, `GRAD_ACCUM=1` pair:
+- `1167534` (`dwnt_muon_notp_b8ga1`) -> `FAILED (ExitCode=1:0)`
+- `1167535` (`dwnt_muon_tp_b8ga1`) -> `FAILED (ExitCode=1:0)`
+- Root cause in both `.err` logs: `torch.OutOfMemoryError` during force
+  autograd path (`heads.py`), with attempted allocation `~938 MiB` on a 44.4 GiB GPU
+  when only `~703 MiB` free.
+
+User-requested relaunch with reduced micro-batch and increased accumulation:
+- `PER_GPU_BATCH=4`
+- `GRAD_ACCUM=2`
+- Effective global train batch remains `8` on single-GPU jobs.
+
+Submitted jobs (timestamp tag `20260219_120351`):
+- `1171450` job name `dwnt_muon_notp_b4ga2`
+  - W&B run: `dwnt_muon_notp_b4ga2_20260219_120351`
+  - Muon TP setting: `MUON_USE_TP_FLATTENED=false`
+- `1171451` job name `dwnt_muon_tp_b4ga2`
+  - W&B run: `dwnt_muon_tp_b4ga2_20260219_120351`
+  - Muon TP setting: `MUON_USE_TP_FLATTENED=true`
+
+Scheduler snapshot after submit:
+- `1171450`: `PENDING (Priority)`
+- `1171451`: `PENDING (Priority)`
+
+## Update (2026-02-19 12:24 EST) - Storage cleanup (checkpoint pruning)
+
+Performed targeted cleanup to free space while preserving active training runs.
+
+Kept active run dirs untouched:
+- `dwnt_r10_fs_lr50_20260218_013050`
+- `dwnt_r10_fs_lr55_20260218_013050`
+- `dwnt_muon_notp_b4ga2_20260219_120351`
+- `dwnt_muon_tp_b4ga2_20260219_120351`
+
+Pruned old heavy serial-hybrid run dirs by keeping only latest `checkpoint_E*.pt`
+and rewriting `checkpoint_list.txt`:
+- `dwnt_s6g2_count_fp32_20260215_121259` (kept `checkpoint_E900.pt`)
+- `dwnt_s6g2_count_r10_20260215_121259` (kept `checkpoint_E900.pt`)
+- `dwnt_s6g2_count_radboost_20260215_121259` (kept `checkpoint_E900.pt`)
+- `dwnt_s5g3_count_20260215_121259` (kept `checkpoint_E1050.pt`)
+- `dwnt_s6g2_count_ctrl_20260215_121259` (kept `checkpoint_E1050.pt`)
+
+Checkpoint files removed:
+- `96` files total (`18+18+18+21+21`)
+
+Space impact:
+- Those 5 dirs: ~`6.2G` -> ~`0.30G`
+- `outputs/runs` total: ~`11G` -> ~`4.7G`
+- Reclaimed: ~`6.3G`
+
+## Update (2026-02-22) - Run analysis snapshot (Adam vs Muon)
+
+Scope analyzed:
+- Adam baseline family:
+  - `1166125` (`dwnt_r10_fs_lr45`)
+  - `1166126` (`dwnt_r10_fs_lr50`)
+  - `1166127` (`dwnt_r10_fs_lr55`)
+- Muon family (`PER_GPU_BATCH=4`, `GRAD_ACCUM=2`):
+  - `1171450` (`dwnt_muon_notp_b4ga2`)
+  - `1171451` (`dwnt_muon_tp_b4ga2`)
+
+Normalization:
+- Adam runs used `world_size=4` while Muon runs used `world_size=1`.
+- Used corrected sample axis `corr_samples = total_samples * world_size`.
+- Common horizon selected as minimum terminal corrected samples across compared runs:
+  - `corr_samples = 640000`.
+
+At common horizon (`corr_samples=640000`), best-so-far train loss:
+- `muon_tp_b4ga2`: `0.3835`
+- `muon_notp_b4ga2`: `0.3954`
+- `adam_lr55`: `0.4521`
+- `adam_lr50`: `0.4674`
+- `adam_lr45`: `0.4891`
+
+Notes:
+- Adam runs were configured with `total_num_steps=80000` and ended `COMPLETED`.
+- Muon runs were configured with `total_num_steps=200000` and ended `TIMEOUT`
+  at 47h limit:
+  - `1171450` last loss `0.3250` at `step=120650`
+  - `1171451` last loss `0.3004` at `step=136515`
+
+Related failure taxonomy (recent history):
+- `b8ga1` Muon (`1167534`, `1167535`) failed by CUDA OOM.
+- Older `s6g2_*` failures on 2026-02-15 (`1160080`-`1160083`) were checkpoint
+  write/storage failures (`PytorchStreamWriter failed writing file`).
+- `1160102`-`1160104` ended due Slurm time limit.

@@ -91,8 +91,12 @@ Optimizer options:
 - Set `optimizer_name=muon` to enable hybrid Muon/AdamW:
   Muon is applied only to hidden-layer 2D matrices matching
   `decoder.decoder.blocks.*` + `*.weight`, while all other parameters stay on AdamW.
+- Optional TP support: set `muon_use_tp_flattened=True` to include flattened
+  TP kernel weights (for example `first_order_tp.tensor_product_tp_component_1.weight`)
+  by applying Muon block-wise over per-path matrix views.
 - Muon knobs in `config_file/config_molfm.yaml`:
-  `muon_beta`, `muon_ns_steps`, `muon_ns_eps`, `muon_nesterov`.
+  `muon_beta`, `muon_ns_steps`, `muon_ns_eps`, `muon_nesterov`,
+  `muon_use_tp_flattened`.
 
 Node-only FMM variant:
 
