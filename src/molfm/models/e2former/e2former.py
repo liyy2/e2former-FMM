@@ -8,7 +8,10 @@ import e3nn
 import torch
 import torch.nn.functional as F
 from sklearn.cluster import KMeans
-from torch_scatter import scatter_mean, scatter_sum, scatter_softmax
+try:
+    from torch_scatter import scatter_mean, scatter_sum, scatter_softmax
+except Exception:
+    from molfm.utils.pyg_fallback import scatter_mean, scatter_softmax, scatter_sum
 from e3nn import o3
 from e3nn.util.jit import compile_mode
 # from fairchem.core.models.equiformer_v2.equiformer_v2_deprecated import EquiformerV2
@@ -22,7 +25,7 @@ from fairchem.core.models.escn.so3 import SO3_Embedding, SO3_Rotation
 # for bessel radial basis
 try:
     from fairchem.core.models.gemnet.layers.radial_basis import RadialBasis
-except ModuleNotFoundError:
+except Exception:
     class RadialBasis(torch.nn.Module):
         """Fallback radial basis when GemNet optional deps are unavailable."""
 
@@ -816,6 +819,7 @@ class E2AttentionHybridShortLong(torch.nn.Module):
         fmm_radial_init_scale: float = 0.05,
         fmm_radial_low_kappa_bias: float = 2.0,
         fmm_coupling_norm: str = "sqrt",
+        fmm_learnable_coupling_weights: bool = True,
         hybrid_long_scale_init: float = 1.0,
         **kwargs,
     ):
@@ -877,6 +881,7 @@ class E2AttentionHybridShortLong(torch.nn.Module):
             fmm_radial_init_scale=fmm_radial_init_scale,
             fmm_radial_low_kappa_bias=fmm_radial_low_kappa_bias,
             fmm_coupling_norm=fmm_coupling_norm,
+            fmm_learnable_coupling_weights=fmm_learnable_coupling_weights,
             **kwargs,
         )
         self.long_scale = nn.Parameter(
@@ -1082,6 +1087,7 @@ class TransBlock(torch.nn.Module):
         fmm_radial_init_scale: float = 0.05,
         fmm_radial_low_kappa_bias: float = 2.0,
         fmm_coupling_norm: str = "sqrt",
+        fmm_learnable_coupling_weights: bool = True,
         hybrid_long_scale_init: float = 1.0,
     ):
         super().__init__()
@@ -1186,6 +1192,7 @@ class TransBlock(torch.nn.Module):
             fmm_radial_init_scale=fmm_radial_init_scale,
             fmm_radial_low_kappa_bias=fmm_radial_low_kappa_bias,
             fmm_coupling_norm=fmm_coupling_norm,
+            fmm_learnable_coupling_weights=fmm_learnable_coupling_weights,
             hybrid_long_scale_init=hybrid_long_scale_init,
         )
 
@@ -3097,6 +3104,9 @@ class E2former(torch.nn.Module):
         self.fmm_radial_init_scale = float(kwargs.pop("fmm_radial_init_scale", 0.05))
         self.fmm_radial_low_kappa_bias = float(kwargs.pop("fmm_radial_low_kappa_bias", 2.0))
         self.fmm_coupling_norm = str(kwargs.pop("fmm_coupling_norm", "sqrt"))
+        self.fmm_learnable_coupling_weights = bool(
+            kwargs.pop("fmm_learnable_coupling_weights", True)
+        )
         self.hybrid_long_scale_init = float(kwargs.pop("hybrid_long_scale_init", 1.0))
         if self.node_only_attention and self.decouple_EF:
             raise ValueError(
@@ -3205,6 +3215,7 @@ class E2former(torch.nn.Module):
                 fmm_radial_init_scale=self.fmm_radial_init_scale,
                 fmm_radial_low_kappa_bias=self.fmm_radial_low_kappa_bias,
                 fmm_coupling_norm=self.fmm_coupling_norm,
+                fmm_learnable_coupling_weights=self.fmm_learnable_coupling_weights,
                 hybrid_long_scale_init=self.hybrid_long_scale_init,
             )
             self.blocks.append(blk)
@@ -3243,6 +3254,7 @@ class E2former(torch.nn.Module):
                 fmm_radial_init_scale=self.fmm_radial_init_scale,
                 fmm_radial_low_kappa_bias=self.fmm_radial_low_kappa_bias,
                 fmm_coupling_norm=self.fmm_coupling_norm,
+                fmm_learnable_coupling_weights=self.fmm_learnable_coupling_weights,
                 hybrid_long_scale_init=self.hybrid_long_scale_init,
             )
 

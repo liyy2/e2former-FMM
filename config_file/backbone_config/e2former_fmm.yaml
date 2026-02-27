@@ -54,6 +54,8 @@ fmm_compute_dtype: "auto" # auto|fp32|bf16|fp16
 fmm_value_head_dim: 8
 # Coupling-path normalization in FMM TP aggregation: count|sqrt|none
 fmm_coupling_norm: "sqrt"
+# Learnable per-path mixing weights in FMM CG coupling.
+fmm_learnable_coupling_weights: true
 # Learnable spectral radial-mixture coefficients for global FMM.
 fmm_learnable_radial_coeffs: true
 # per_l_head | per_l_shared | head | shared

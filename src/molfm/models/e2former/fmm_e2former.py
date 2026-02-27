@@ -36,7 +36,7 @@ Data flow summary:
             out_ell[i,h,m_ell,lambda,Cv] via linear-attention + plane-wave
      -> CG coupling: contract (m_ell, lambda) with precomputed TP matrix
             to produce out_L[i,h,m_L,Cv] for each output degree L
-     -> Average over coupling paths, unpack back to flat node indexing
+     -> Learnable weighted sum over coupling paths, unpack back to flat node indexing
     Output: (N, (lmax+1)^2, C)
 
 Notation / index conventions used in this file:
@@ -64,7 +64,7 @@ from e3nn import o3
 from torch import nn
 
 from .fmm_prototype import AlphaFRYSphericalFMMMultiL
-from .fmm_utils import _cueq_ops_available
+from .fmm_utils import _cueq_fast_ops_available, _cueq_ops_available
 from .module_utils import SO3_Linear2Scalar_e2former
 
 
@@ -117,6 +117,10 @@ class E2AttentionNodeFMM(nn.Module):
         fmm_coupling_norm: Coupling-path normalization after CG aggregation:
             "count" (divide by #paths), "sqrt" (divide by sqrt(#paths)),
             or "none" (no extra divide).
+        fmm_learnable_coupling_weights: If True, apply learnable per-path
+            CG coupling mixing weights. Initialized as flattened
+            `randn(weight_numel)` with per-block fan-in rescale to match
+            original E2Former TP initialization style.
         (all other kwargs are accepted for interface compatibility but discarded)
     """
 
@@ -151,6 +155,7 @@ class E2AttentionNodeFMM(nn.Module):
         fmm_radial_init_scale: float = 0.05,
         fmm_radial_low_kappa_bias: float = 2.0,
         fmm_coupling_norm: str = "sqrt",
+        fmm_learnable_coupling_weights: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -274,6 +279,7 @@ class E2AttentionNodeFMM(nn.Module):
         self.fmm_coupling_norm = self._normalize_coupling_norm_mode(
             fmm_coupling_norm
         )
+        self.fmm_learnable_coupling_weights = bool(fmm_learnable_coupling_weights)
         # Radial basis: f_l(r) = sum_q a_q * j_l(kappa_q * r)
         # The compact default band (1.0..1.4) significantly reduces directional
         # quadrature aliasing (better equivariance) while keeping compute cost unchanged.
@@ -421,7 +427,9 @@ class E2AttentionNodeFMM(nn.Module):
         # Multiple (ell, lambda) pairs can couple to the same L, contributing
         # separate "paths" that will be summed in forward().
         self.tp_out_blocks: list[tuple[int, int, int, int]] = []
+        self.tp_out_weight_slices: list[tuple[int, int]] = []
         coupling_count = torch.zeros(self.lmax + 1, dtype=torch.float32)
+        coupling_weight_numel = 0
         offset = 0
         for out_idx, (mul, ir) in enumerate(tp_all.irreps_out):
             dim = int(mul * ir.dim)
@@ -431,10 +439,34 @@ class E2AttentionNodeFMM(nn.Module):
             out_l = int(ir.l)
             if out_l <= self.lmax:
                 self.tp_out_blocks.append((out_l, offset, offset + dim, int(mul)))
+                self.tp_out_weight_slices.append(
+                    (coupling_weight_numel, coupling_weight_numel + int(mul))
+                )
+                coupling_weight_numel += int(mul)
                 coupling_count[out_l] += float(mul)
             offset += dim
 
         self.tp_out_dim = int(tp_all.irreps_out.dim)  # R_total
+
+        # Learnable per-path coupling mixing weights for Step 7 aggregation.
+        # This follows the original E2Former TP style:
+        #   - flattened parameter vector (weight_numel,)
+        #   - random normal initialization
+        #   - per-block fan-in rescale by 1/sqrt(fan_in)
+        # Here fan_in is the number of coupling paths (mul) merged into each block.
+        coupling_mix_weight = torch.randn(coupling_weight_numel, dtype=torch.float32)
+        for (_, _, _, mul), (w_start, w_end) in zip(
+            self.tp_out_blocks, self.tp_out_weight_slices
+        ):
+            fan_in = max(int(mul), 1)
+            coupling_mix_weight[w_start:w_end].mul_(fan_in ** -0.5)
+        if self.fmm_learnable_coupling_weights:
+            self.coupling_mix_weight = nn.Parameter(coupling_mix_weight)
+        else:
+            self.register_buffer(
+                "coupling_mix_weight",
+                torch.ones(coupling_weight_numel, dtype=torch.float32),
+            )
 
         # Register the full right-projection as a buffer (not a parameter).
         self.register_buffer("tp_right_all", right_all.contiguous())
@@ -730,7 +762,7 @@ class E2AttentionNodeFMM(nn.Module):
 
         use_cuda = torch.cuda.is_available() and _cueq_ops_available()
         device = torch.device("cuda" if use_cuda else "cpu")
-        use_fallback = not use_cuda
+        use_fallback = (not use_cuda) or (not _cueq_fast_ops_available())
 
         try:
             cue_irreps_ell = cue.Irreps("O3", str(irreps_ell))
@@ -1006,27 +1038,32 @@ class E2AttentionNodeFMM(nn.Module):
         #   - mul: number of (ell, lambda) paths producing this L (may be > 1)
         #
         # When mul > 1, the multiple paths are summed (averaged later).
-        for out_l, start, end, mul in self.tp_out_blocks:
+        coupling_mix_weight = self.coupling_mix_weight
+        if (
+            coupling_mix_weight.device != coupled_all.device
+            or coupling_mix_weight.dtype != coupled_all.dtype
+        ):
+            coupling_mix_weight = coupling_mix_weight.to(
+                device=coupled_all.device,
+                dtype=coupled_all.dtype,
+            )
+        for (out_l, start, end, mul), (w_start, w_end) in zip(
+            self.tp_out_blocks, self.tp_out_weight_slices
+        ):
             m_out = 2 * out_l + 1
             block = coupled_all[:, :, :, start:end, :]  # (B, N, H, mul*m_out, Cv)
-            if mul > 1:
-                # Multiple coupling paths -> split and sum them.
-                block = block.view(
-                    num_graphs,
-                    max_nodes,
-                    self.num_attn_heads,
-                    mul,
-                    m_out,
-                    self.value_head_dim,
-                ).sum(dim=3)  # (B, N, H, m_out, Cv)
-            else:
-                block = block.view(
-                    num_graphs,
-                    max_nodes,
-                    self.num_attn_heads,
-                    m_out,
-                    self.value_head_dim,
-                )
+            # Split the block into explicit coupling paths and apply learnable
+            # per-path mixing weights before summing across paths.
+            block = block.view(
+                num_graphs,
+                max_nodes,
+                self.num_attn_heads,
+                mul,
+                m_out,
+                self.value_head_dim,
+            )
+            mix = coupling_mix_weight[w_start:w_end].view(1, 1, 1, mul, 1, 1)
+            block = (block * mix).sum(dim=3)  # (B, N, H, m_out, Cv)
 
             # Rearrange from (B, N, H, m_out, Cv) to (B, N, m_out, H*Cv) = (B, N, m_out, C)
             # to match the input irreps layout.

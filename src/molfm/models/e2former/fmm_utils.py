@@ -236,17 +236,33 @@ def infer_compute_dtype(dtype: torch.dtype) -> torch.dtype:
 
 @lru_cache(maxsize=1)
 def _cueq_ops_available() -> bool:
-    """Return True when cuEquivariance torch kernels are importable and usable."""
+    """Return True when cuEquivariance torch backend is importable.
+
+    Newer cuequivariance releases may not expose a separate
+    ``cuequivariance_ops_torch`` module on PyPI; requiring it would produce
+    false negatives even when the torch backend is usable (with fallback).
+    """
     if importlib.util.find_spec("cuequivariance_torch") is None:
-        return False
-    if importlib.util.find_spec("cuequivariance_ops_torch") is None:
         return False
     try:
         # Some broken installs print loader errors to stderr; suppress them here.
         with contextlib.redirect_stderr(io.StringIO()):
             with contextlib.redirect_stdout(io.StringIO()):
-                import cuequivariance_ops_torch  # noqa: F401
                 import cuequivariance_torch as cuet  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
+def _cueq_fast_ops_available() -> bool:
+    """Return True when optional fast cueq ops module is present and importable."""
+    if importlib.util.find_spec("cuequivariance_ops_torch") is None:
+        return False
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.redirect_stdout(io.StringIO()):
+                import cuequivariance_ops_torch  # noqa: F401
         return True
     except Exception:
         return False
@@ -258,6 +274,7 @@ def _get_cueq_sh_module(
     normalize: bool,
     device_type: str,
     device_index: int,
+    use_fallback: bool,
 ) -> torch.nn.Module:
     """Build/cache a cuEquivariance spherical-harmonics module for one degree l."""
     import cuequivariance_torch as cuet
@@ -267,7 +284,11 @@ def _get_cueq_sh_module(
         if device_index < 0
         else f"{device_type}:{device_index}"
     )
-    module = cuet.SphericalHarmonics([int(l)], normalize=normalize, use_fallback=False)
+    module = cuet.SphericalHarmonics(
+        [int(l)],
+        normalize=normalize,
+        use_fallback=bool(use_fallback),
+    )
     return module.to(device=device)
 
 
@@ -318,6 +339,7 @@ def spherical_harmonics_real(
         bool(normalize),
         vectors.device.type,
         -1 if vectors.device.index is None else int(vectors.device.index),
+        not _cueq_fast_ops_available(),
     )
     flat = vectors.reshape(-1, 3)
     y = module(flat).reshape(vectors.shape[:-1] + (2 * int(l) + 1,))

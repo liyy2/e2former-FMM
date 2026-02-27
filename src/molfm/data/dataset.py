@@ -17,7 +17,10 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import Subset
-from torch_cluster import radius_graph
+try:
+    from torch_cluster import radius_graph
+except Exception:
+    from molfm.utils.pyg_fallback import radius_graph
 
 from molfm.data.collator import pack_batch
 from molfm.data.utils import dataset_profile

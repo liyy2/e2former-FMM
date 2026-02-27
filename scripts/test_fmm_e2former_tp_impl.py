@@ -48,6 +48,15 @@ def _parse_args() -> argparse.Namespace:
         help="Requested tensor-product backend for E2AttentionNodeFMM.",
     )
     parser.add_argument(
+        "--fmm-learnable-coupling-weights",
+        type=lambda x: str(x).lower() in {"1", "true", "yes", "y", "on"},
+        default=False,
+        help=(
+            "Enable learnable per-path coupling weights. Keep this off for a "
+            "pure TP-vs-explicit-CG equivalence check."
+        ),
+    )
+    parser.add_argument(
         "--tol-coupling",
         type=float,
         default=2e-4,
@@ -374,6 +383,7 @@ def main() -> None:
         num_attn_heads=int(args.heads),
         attn_scalar_head=int(args.head_dim),
         tp_type=tp_type,
+        fmm_learnable_coupling_weights=bool(args.fmm_learnable_coupling_weights),
     ).to(device)
     module.eval()
     if args.tp_backend != "auto" and module.tp_backend != args.tp_backend:

@@ -18,7 +18,10 @@ from fairchem.core.models.equiformer_v2.so3 import (
 )
 from fairchem.core.models.escn.so3 import SO3_Embedding
 from torch import nn
-from torch_cluster import radius_graph
+try:
+    from torch_cluster import radius_graph
+except Exception:
+    from molfm.utils.pyg_fallback import radius_graph
 from torch_geometric.data import Data
 
 from .tensor_product import Simple_TensorProduct

@@ -132,6 +132,12 @@ def _parse_args() -> argparse.Namespace:
         choices=["count", "sqrt", "none"],
         help="Coupling-path normalization for FMM TP aggregation.",
     )
+    parser.add_argument(
+        "--fmm-learnable-coupling-weights",
+        type=lambda x: str(x).lower() in {"1", "true", "yes", "y", "on"},
+        default=True,
+        help="Enable TP-style learnable per-path coupling weights in FMM.",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
@@ -244,6 +250,7 @@ def main() -> None:
         fmm_compute_dtype=args.fmm_compute_dtype,
         fmm_value_head_dim=args.fmm_value_head_dim,
         fmm_coupling_norm=args.fmm_coupling_norm,
+        fmm_learnable_coupling_weights=args.fmm_learnable_coupling_weights,
         **common,
     ).to(device)
 
@@ -262,7 +269,8 @@ def main() -> None:
         f"fmm_num_kappa={args.fmm_num_kappa} kappa=[{args.fmm_kappa_min},{args.fmm_kappa_max}] "
         f"fmm_num_directions={args.fmm_num_directions} fmm_compute_dtype={args.fmm_compute_dtype} "
         f"fmm_value_head_dim={args.fmm_value_head_dim} "
-        f"fmm_coupling_norm={args.fmm_coupling_norm}"
+        f"fmm_coupling_norm={args.fmm_coupling_norm} "
+        f"fmm_learnable_coupling_weights={args.fmm_learnable_coupling_weights}"
     )
     print(f"baseline(edge) forward: {t_baseline * 1e3:.3f} ms")
     print(f"fmm-node forward:       {t_fmm_node * 1e3:.3f} ms")
@@ -280,6 +288,7 @@ def main() -> None:
             fmm_compute_dtype=args.fmm_compute_dtype,
             fmm_value_head_dim=args.fmm_value_head_dim,
             fmm_coupling_norm=args.fmm_coupling_norm,
+            fmm_learnable_coupling_weights=args.fmm_learnable_coupling_weights,
             **common,
         ).to(device)
         t_hybrid = _time_forward(
@@ -314,6 +323,7 @@ def main() -> None:
             fmm_compute_dtype=args.fmm_compute_dtype,
             fmm_value_head_dim=args.fmm_value_head_dim,
             fmm_coupling_norm=args.fmm_coupling_norm,
+            fmm_learnable_coupling_weights=args.fmm_learnable_coupling_weights,
             **common,
         ).to(device)
         t_serial = _time_forward(

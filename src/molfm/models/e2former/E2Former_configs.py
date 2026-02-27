@@ -144,8 +144,12 @@ class E2FormerBackboneConfigs:
     fmm_compute_dtype: str = "auto"  # auto|fp32|bf16|fp16
     # Optional per-head value bottleneck for node-only FMM (0 = disable).
     fmm_value_head_dim: int = 8
+    # Coupling-path normalization in node-only/hybrid FMM TP aggregation.
+    fmm_coupling_norm: str = "sqrt"
     # Spectral radial-mixture controls for node-only/hybrid FMM branches.
     fmm_learnable_radial_coeffs: bool = True
+    # Learnable per-path CG coupling mixing weights in FMM.
+    fmm_learnable_coupling_weights: bool = True
     # one of: per_l_head | per_l_shared | head | shared
     fmm_radial_coeffs_mode: str = "per_l_head"
     fmm_radial_init_scale: float = 0.05

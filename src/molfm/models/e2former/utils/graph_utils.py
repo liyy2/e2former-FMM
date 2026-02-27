@@ -2,10 +2,12 @@
 import torch
 import torch.nn.functional as F
 from e3nn.o3._spherical_harmonics import _spherical_harmonics
-from torch_scatter import scatter
+try:
+    from torch_scatter import scatter
+except Exception:
+    from molfm.utils.pyg_fallback import scatter
 
 
-@torch.jit.script
 def get_node_direction_expansion(
     distance_vec: torch.Tensor, edge_index: torch.Tensor, lmax: int, num_nodes: int
 ):
